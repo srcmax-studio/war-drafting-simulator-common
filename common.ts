@@ -6,7 +6,7 @@ export class PlayerDeck {
     readonly name: string;
     private slots: Map<string, Character | null>;
 
-    constructor(name) {
+    constructor(name: string) {
         this.name = name;
         this.slots = new Map();
         POSITIONS.forEach(pos => {
