@@ -1,4 +1,4 @@
-export const DRAFT_STAGE_PASSIVE_DISGARD = 0;
+export const DRAFT_STAGE_PASSIVE_DISCARD = 0;
 export const DRAFT_STAGE_INIT = 10;
 export const DRAFT_STAGE_PASSIVE = 20;
 
