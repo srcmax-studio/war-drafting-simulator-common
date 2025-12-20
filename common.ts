@@ -2,6 +2,10 @@ export const DRAFT_STAGE_PASSIVE_DISCARD = 0;
 export const DRAFT_STAGE_INIT = 10;
 export const DRAFT_STAGE_PASSIVE = 20;
 
+export const PHASE_LOBBY = 0
+export const PHASE_DRAFT = 10
+export const PHASE_SIMULATING = 20
+
 export class PlayerDeck {
     readonly name: string;
     private slots: Map<string, Character | null>;
@@ -104,5 +108,3 @@ export const POSITIONS = [
     {key: "先锋", desc: "突击队长，阵前单挑", stats: ["武力"]},
     {key: "禁卫", desc: "皇帝近卫，安全核心", stats: ["武力", "统帅"]},
 ]
-
-
