@@ -25,6 +25,15 @@ export class PlayerDeck {
         this.slots.set(posKey, character);
     }
 
+    addCharacter(character: Character): void {
+        for (const [key, value] of this.slots) {
+            if (value === null) {
+                this.slots.set(key, character);
+                return;
+            }
+        }
+    }
+
     switchPositions(posKeyA: string, posKeyB: string): void {
         if (!this.slots.has(posKeyA) || !this.slots.has(posKeyB)) {
             throw new Error("One or both positions are invalid.");
