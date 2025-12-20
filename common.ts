@@ -55,7 +55,21 @@ export class PlayerDeck {
         this.slots.forEach((char, key) => {
             data[key] = char ? char.名字 : null;
         });
-        return JSON.stringify(data);
+        return JSON.stringify({ name: this.name, slots: data });
+    }
+
+    static deserialize(json: string, characterResolver: (name: string) => Character): PlayerDeck {
+        const parsed = JSON.parse(json);
+        const deck = new PlayerDeck(parsed.name);
+
+        for (const [posKey, charName] of Object.entries(parsed.slots)) {
+            if (charName) {
+                const character = characterResolver(charName as string);
+                deck.assignCharacter(posKey, character);
+            }
+        }
+
+        return deck;
     }
 
     getPosition(posKey: string): Character | null {
