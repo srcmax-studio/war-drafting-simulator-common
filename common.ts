@@ -1,6 +1,7 @@
 export const DRAFT_STAGE_PASSIVE_DISCARD = 0;
 export const DRAFT_STAGE_INIT = 10;
 export const DRAFT_STAGE_PASSIVE = 20;
+export const DRAFT_STAGE_FINAL_CHANGES = 30;
 
 export const PHASE_LOBBY = 0
 export const PHASE_DRAFT = 10
