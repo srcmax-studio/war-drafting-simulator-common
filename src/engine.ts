@@ -324,7 +324,7 @@ export function submitTurnIntent(state: GameState, playerId: PlayerId, intent: T
   owner.intent = clone(intent);
   state.processedRequestIds.push(intent.requestId);
   appendEvent(state, 'turn_submitted', { intent: clone(intent) }, { playerId, public: false });
-  appendEvent(state, 'turn_plan_updated', { playerId, deploymentCount: intent.deployments.length });
+  appendEvent(state, 'turn_plan_updated', { playerId, deploymentCount: intent.deployments.length }, { playerId, public: false });
   return { ok: true };
 }
 
@@ -335,7 +335,7 @@ export function undoTurnIntent(state: GameState, playerId: PlayerId, requestId: 
   delete owner.intent;
   state.processedRequestIds.push(requestId);
   appendEvent(state, 'turn_undone', { requestId }, { playerId, public: false });
-  appendEvent(state, 'turn_plan_updated', { playerId, deploymentCount: 0 });
+  appendEvent(state, 'turn_plan_updated', { playerId, deploymentCount: 0 }, { playerId, public: false });
   return { ok: true };
 }
 

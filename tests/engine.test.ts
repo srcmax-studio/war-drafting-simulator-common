@@ -407,6 +407,14 @@ describe('stake, privacy and replay', () => {
     expect(createPublicView(state).players.every((player) => player.hand === undefined)).toBe(true);
   });
 
+  it('does not expose an opponent turn plan or deployment count', () => {
+    const state = makeGame();
+    submitTurnIntent(state, 'p1', { requestId: 'private-plan', turn: 1, deployments: [] });
+    expect(createPlayerView(state, 'p1').events.some((event) => event.type === 'turn_plan_updated')).toBe(true);
+    expect(createPlayerView(state, 'p2').events.some((event) => event.type === 'turn_plan_updated' || event.type === 'turn_submitted')).toBe(false);
+    expect(createPublicView(state).events.some((event) => event.type === 'turn_plan_updated' || event.type === 'turn_submitted')).toBe(false);
+  });
+
   it('replays a complete six-turn game to the identical state', () => {
     const state = makeGame(77);
     raiseBanner(state, 'p1', 'replay-banner');
