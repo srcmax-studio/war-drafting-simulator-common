@@ -511,12 +511,28 @@ function deployCards(state: GameState, owner: PlayerState, intent: TurnIntent): 
   const sorted = [...intent.deployments].sort((left, right) => left.order - right.order || left.cardId.localeCompare(right.cardId));
   for (const deployment of sorted) {
     const handIndex = owner.hand.indexOf(deployment.cardId);
-    if (handIndex < 0) throw new RuleError('CARD_LEFT_HAND', 'A submitted card left the hand before resolution.');
+    if (handIndex < 0) {
+      appendEvent(state, 'deployment_fizzled', { playerId: owner.playerId, cardId: deployment.cardId, frontId: deployment.frontId, reason: 'card_left_hand' });
+      continue;
+    }
     const definition = state.cardCatalog[deployment.cardId];
     if (!definition) throw new RuleError('UNKNOWN_CARD', `Unknown card: ${deployment.cardId}`);
     const front = getFrontState(state, deployment.frontId);
+    if ((owner.fronts[deployment.frontId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, deployment.frontId)) {
+      appendEvent(state, 'deployment_fizzled', { playerId: owner.playerId, cardId: deployment.cardId, frontId: deployment.frontId, reason: 'front_capacity' });
+      continue;
+    }
+    if (validateFrontRestriction(front.definition, definition)) {
+      appendEvent(state, 'deployment_fizzled', { playerId: owner.playerId, cardId: deployment.cardId, frontId: deployment.frontId, reason: 'front_restriction' });
+      continue;
+    }
+    const cost = getEffectiveCost(state, definition, deployment.frontId, owner.playerId);
+    if (cost > owner.energy) {
+      appendEvent(state, 'deployment_fizzled', { playerId: owner.playerId, cardId: deployment.cardId, frontId: deployment.frontId, reason: 'energy_changed' });
+      continue;
+    }
     runCardTrigger(state, owner, undefined, definition.cardId, 'before_play', { playerId: owner.playerId, frontId: deployment.frontId });
-    owner.energy = Math.max(0, owner.energy - getEffectiveCost(state, definition, deployment.frontId, owner.playerId));
+    owner.energy = Math.max(0, owner.energy - cost);
     owner.hand.splice(handIndex, 1);
     const abilities = getCardAbilities(definition);
     const delayed = abilities.some((ability) => ability.abilityId === 'ambush') || ['delayed_reveal', 'reverse_reveal'].includes(front.definition.effectId);

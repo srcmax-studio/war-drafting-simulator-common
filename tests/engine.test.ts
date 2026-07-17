@@ -309,6 +309,31 @@ describe('turn validation and resolution', () => {
     const event = state.eventLog.find((candidate) => candidate.type === 'reveal_order');
     expect(event?.payload.playerIds).toEqual([state.setup.players.find((player) => player.playerId === (event?.payload.playerIds as string[])[0])!.playerId, (event?.payload.playerIds as string[])[1]]);
   });
+
+  it('logs a deterministic fizzle when disruption removes a locked card', () => {
+    const state = makeGame(991);
+    const frontId = state.fronts[0]!.definition.frontId;
+    const disruptor = cards[0]!;
+    const target = cards[12]!;
+    Object.assign(state.cardCatalog[disruptor.cardId]!, {
+      abilityId: 'discard_pressure',
+      abilityArgs: { amount: 1 },
+      abilityTextZh: '部署：对手弃置一张手牌。',
+      trigger: 'deploy',
+      targetRule: 'opponent_hand'
+    });
+    delete state.cardCatalog[disruptor.cardId]!.abilities;
+    state.players[0].hand = [disruptor.cardId];
+    state.players[1].hand = [target.cardId];
+    state.players[0].energy = 6;
+    state.players[1].energy = 6;
+    state.initiativePlayerId = 'p1';
+    expect(submitTurnIntent(state, 'p1', { requestId: 'fizzle-p1', turn: state.turn, deployments: [{ cardId: disruptor.cardId, frontId, order: 0 }] }).ok).toBe(true);
+    expect(submitTurnIntent(state, 'p2', { requestId: 'fizzle-p2', turn: state.turn, deployments: [{ cardId: target.cardId, frontId, order: 0 }] }).ok).toBe(true);
+    expect(lockTurn(state, 'p1', 'fizzle-lock-p1').ok).toBe(true);
+    expect(lockTurn(state, 'p2', 'fizzle-lock-p2').ok).toBe(true);
+    expect(state.eventLog.some((event) => event.type === 'deployment_fizzled' && event.payload.reason === 'card_left_hand')).toBe(true);
+  });
 });
 
 describe('front mechanics', () => {
