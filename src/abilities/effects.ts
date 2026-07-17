@@ -147,6 +147,7 @@ const createToken: EffectHandler = ({ context, effect }) => {
   if (!cardId || !context.gameState.cardCatalog[cardId]) return 0;
   const count = Math.max(1, Math.floor(numeric(effect)));
   owner.hand.push(...Array.from({ length: count }, () => cardId));
+  emit(context, 'card_generated', { playerId: owner.playerId, cardId, count, reason: 'ability' });
   return count;
 };
 
@@ -158,6 +159,7 @@ const copyCard: EffectHandler = ({ context, targets, effect }) => {
     return [];
   }).slice(0, Math.max(1, Math.floor(numeric(effect))));
   owner.hand.push(...copies);
+  for (const cardId of copies) emit(context, 'card_copied', { playerId: owner.playerId, cardId, count: 1, reason: 'ability' });
   return copies.length;
 };
 
@@ -226,6 +228,7 @@ const reviveCard: EffectHandler = ({ context, targets }) => {
     card.revealed = true;
     card.createdByEffect = true;
     owner.fronts[frontId]!.push(card);
+    emit(context, 'card_revived', { playerId: owner.playerId, instanceId: card.instanceId, cardId: card.cardId, frontId, reason: 'ability' });
     changed += 1;
   }
   return changed;

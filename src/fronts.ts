@@ -6,6 +6,8 @@ interface FrontMetadata {
   categories?: string[];
   incompatibleWith?: string[];
   incompatibleTags?: string[];
+  focalPoint?: { x: number; y: number };
+  dominantColor?: string;
 }
 
 const front = (
@@ -36,7 +38,13 @@ const front = (
   minimumClientVersion: PROTOCOL_VERSION,
   packId: 'core',
   tags,
-  strategyZh
+  strategyZh,
+  art: {
+    artKey: frontId,
+    altZh: `${nameZh}战线场景`,
+    focalPoint: metadata.focalPoint ?? { x: 0.5, y: 0.46 },
+    ...(metadata.dominantColor ? { dominantColor: metadata.dominantColor } : {})
+  }
 });
 
 export const FRONT_DEFINITIONS: FrontDefinition[] = [
@@ -143,6 +151,8 @@ export function validateFrontDefinitions(fronts: readonly FrontDefinition[]): st
     if (!Number.isFinite(item.weight) || item.weight <= 0) errors.push(`Invalid weight: ${item.frontId}`);
     if (!['simple', 'advanced', 'chaotic'].includes(item.complexity)) errors.push(`Invalid complexity: ${item.frontId}`);
     if (!item.packId || item.categories.length === 0) errors.push(`Missing pool metadata: ${item.frontId}`);
+    if (!item.art.artKey || !item.art.altZh) errors.push(`Missing artwork metadata: ${item.frontId}`);
+    if (item.art.focalPoint.x < 0 || item.art.focalPoint.x > 1 || item.art.focalPoint.y < 0 || item.art.focalPoint.y > 1) errors.push(`Invalid artwork focal point: ${item.frontId}`);
     for (const incompatibleId of item.incompatibleWith ?? []) if (!fronts.some((front) => front.frontId === incompatibleId)) errors.push(`Unknown incompatible front ${incompatibleId}: ${item.frontId}`);
   }
   if (fronts.filter((item) => item.enabled).length < 72) errors.push('At least 72 fronts must be enabled.');

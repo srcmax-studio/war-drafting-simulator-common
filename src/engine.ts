@@ -565,7 +565,10 @@ function deployCards(state: GameState, owner: PlayerState, intent: TurnIntent): 
       instanceId: source.instanceId,
       cardId: delayed ? null : source.cardId,
       frontId: source.frontId,
-      revealed: !delayed
+      revealed: !delayed,
+      cost,
+      baseCost: definition.cost,
+      basePower: definition.power
     });
     runCardTrigger(state, owner, source, source.cardId, 'on_play', { instanceId: source.instanceId, playerId: owner.playerId, frontId: source.frontId });
     if (!delayed) {
@@ -839,6 +842,7 @@ export function applyFrontTurnEffect(state: GameState, frontId: string, supplied
         card.currentPower += amount;
         card.modifiers.push({ source: `front:${frontId}:revive`, amount });
         owner.fronts[frontId]!.push(card);
+        appendEvent(state, 'card_revived', { playerId: owner.playerId, instanceId: card.instanceId, cardId: card.cardId, frontId, amount, reason: 'front' });
         delete front.state[key];
         changed += 1;
       }
@@ -1125,7 +1129,17 @@ export function resolveTurn(state: GameState): GameState {
   revealReverseDeployments(state);
   runBoardTrigger(state, 'turn_end');
   resolveAllFrontEffects(state);
-  appendEvent(state, 'turn_resolved', { turn: state.turn });
+  const resolvedPowers = Object.fromEntries(state.fronts.map((front) => [
+    front.definition.frontId,
+    Object.fromEntries(state.players.map((player) => [player.playerId, calculateFrontPower(state, player.playerId, front.definition.frontId)]))
+  ]));
+  const resolvedControl = Object.fromEntries(state.fronts.map((front) => [front.definition.frontId, frontWinner(state, front.definition.frontId)]));
+  appendEvent(state, 'turn_resolved', {
+    turn: state.turn,
+    unusedOrders: Object.fromEntries(state.players.map((player) => [player.playerId, player.energy])),
+    powers: resolvedPowers,
+    control: resolvedControl
+  });
   if (state.turn >= STANDARD_TURNS) {
     runBoardTrigger(state, 'finale');
     runBoardTrigger(state, 'before_scoring');
@@ -1133,6 +1147,13 @@ export function resolveTurn(state: GameState): GameState {
     runFrontOutcomeTriggers(state, preliminary);
     state.winner = calculateWinner(state);
     state.phase = 'ended';
+    appendEvent(state, 'final_state_locked', {
+      powers: Object.fromEntries(state.fronts.map((front) => [
+        front.definition.frontId,
+        Object.fromEntries(state.players.map((player) => [player.playerId, calculateFrontPower(state, player.playerId, front.definition.frontId)]))
+      ])),
+      control: state.winner.frontWinners
+    });
     appendEvent(state, 'game_ended', { winner: state.winner });
     return state;
   }
@@ -1193,6 +1214,13 @@ export function withdraw(state: GameState, playerId: PlayerId, requestId: string
   state.winner = { winnerId: winner.playerId, reason: 'withdrawal', stake: state.stake.current, frontWinners, totals };
   state.phase = 'ended';
   appendEvent(state, 'player_withdrew', { requestId, playerId, winnerId: winner.playerId, stake: state.stake.current }, { playerId });
+  appendEvent(state, 'final_state_locked', {
+    powers: Object.fromEntries(state.fronts.map((front) => [
+      front.definition.frontId,
+      Object.fromEntries(state.players.map((player) => [player.playerId, calculateFrontPower(state, player.playerId, front.definition.frontId)]))
+    ])),
+    control: frontWinners
+  });
   appendEvent(state, 'game_ended', { winner: state.winner });
   return { ok: true };
 }
@@ -1218,7 +1246,12 @@ function hiddenFrontDefinition(index: number): FrontDefinition {
     minimumClientVersion: PROTOCOL_VERSION,
     packId: 'core',
     tags: ['hidden'],
-    strategyZh: '根据未知规则评估投入风险。'
+    strategyZh: '根据未知规则评估投入风险。',
+    art: {
+      artKey: 'hidden',
+      altZh: '未揭示战线迷雾',
+      focalPoint: { x: 0.5, y: 0.5 }
+    }
   };
 }
 

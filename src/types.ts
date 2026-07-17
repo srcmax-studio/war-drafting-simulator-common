@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 'aeonfront/2';
+export const PROTOCOL_VERSION = 'aeonfront/3';
 export const CARD_SCHEMA_VERSION = 2;
 export const DECK_SCHEMA_VERSION = 2;
 export const STANDARD_TURNS = 6;
@@ -290,6 +290,16 @@ export interface CardDefinition {
 
 export type FrontComplexity = 'simple' | 'advanced' | 'chaotic';
 
+export interface FrontArtMetadata {
+  artKey: string;
+  altZh: string;
+  focalPoint: {
+    x: number;
+    y: number;
+  };
+  dominantColor?: string;
+}
+
 export interface FrontPoolMetadata {
   weight: number;
   complexity: FrontComplexity;
@@ -311,6 +321,7 @@ export interface FrontDefinition extends FrontPoolMetadata {
   enabled: boolean;
   tags: string[];
   strategyZh: string;
+  art: FrontArtMetadata;
 }
 
 export interface PowerModifier {

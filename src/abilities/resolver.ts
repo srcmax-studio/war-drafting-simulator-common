@@ -59,7 +59,21 @@ export function resolveAbility(context: AbilityContext): GameEvent[] {
   };
   let changed = 0;
   for (const effect of context.ability.effects) {
-    changed += applyEffect({ context, effect, targets, repeat });
+    const beforePower = new Map(targets.filter((target) => target.kind === 'card').map((target) => [target.card.instanceId, target.card.currentPower]));
+    const effectChanged = applyEffect({ context, effect, targets, repeat });
+    changed += effectChanged;
+    const deltas = targets.flatMap((target) => {
+      if (target.kind !== 'card') return [];
+      const before = beforePower.get(target.card.instanceId) ?? target.card.currentPower;
+      const amount = target.card.currentPower - before;
+      return amount === 0 ? [] : [{ playerId: target.owner.playerId, instanceId: target.card.instanceId, cardId: target.card.cardId, amount }];
+    });
+    emit(context, 'ability_effect_applied', {
+      effectType: effect.type,
+      changed: effectChanged,
+      targetInstanceIds: targets.filter((target) => target.kind === 'card').map((target) => target.card.instanceId),
+      deltas
+    });
     if (context.eventQueue.length > MAX_EVENTS_PER_RESOLUTION) throw new RuleError('EVENT_LIMIT_EXCEEDED', 'Ability event limit exceeded.');
   }
   recordUsage(context, source);

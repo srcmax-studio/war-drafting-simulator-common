@@ -1,34 +1,46 @@
-# Aeonfront Protocol Version 2
+# Aeonfront Protocol Version 3
 
-`aeonfront/2` is the required protocol for the multi-ability catalog and versioned custom decks. Version 1 clients and servers must reject the connection with `PROTOCOL_MISMATCH`; they cannot safely interpret version 2 card or front state.
+`aeonfront/3` introduces explicit lobby, room, matchmaking and concurrent-game scopes. Version 2 clients and servers must reject the connection with `PROTOCOL_MISMATCH`; version 2 assumes one global room and cannot safely route version 3 messages.
+
+## Envelope
+
+Every client message includes `protocolVersion` and a unique `requestId`. Every server message includes `protocolVersion`, a monotonic transport `sequence`, and the originating `requestId` when applicable. Room and game messages also carry `roomId` or `gameId` at the envelope level.
+
+The runtime validator checks the action-specific shape, identifier bounds, string lengths, room settings, deck arrays and turn values before dispatch. Servers additionally enforce payload byte limits, per-connection rates and request-id replay protection.
+
+## Connection And Lobby
+
+`join` establishes or reconnects a player session. It does not select a deck or start a game. The client then sends `enterLobby` and receives `lobbyEntered` followed by a `lobbySnapshot` containing:
+
+- public server health and version information;
+- the player's public presence record;
+- bounded online presence, room and lobby-chat lists;
+- the player's current matchmaking state.
+
+Presence exposes only nickname, state, join time and a coarse latency bucket. It never exposes addresses, credentials or reconnect tokens.
+
+## Rooms And Matchmaking
+
+Room messages are `createRoom`, `joinRoom`, `leaveRoom`, `updateRoom`, `kickPlayer`, `selectDeck`, `setReady` and `sendRoomChat`. Room snapshots expose deck name and validity but not card IDs unless a completed match is being reviewed.
+
+Quick matching uses `joinMatchmaking`, `leaveMatchmaking`, `matchFound`, `acceptMatch` and `declineMatch`. A matched pair receives an isolated room with an acceptance deadline. Declines, timeouts and disconnects release both tickets without affecting other rooms.
+
+## Game Scope
+
+Game actions retain the deterministic turn intent and now accept a `gameId` scope. Private state, event batches and completion payloads carry the same game scope. Each game has its own seed, state, event sequence, deadline and reconnect boundary.
+
+Unrevealed fronts use a synthetic `front-slot-N` definition with the generic `hidden` artwork key. The actual front ID, name, effect and artwork key are absent from the player view until reveal. Concealed enemy cards similarly expose only their public instance identity.
+
+## Battle Summary
+
+At completion, participants receive a `gameEnded` payload with a deterministic `BattleSummary` and an optional serialized replay. The summary derives deployments, military orders, unused orders, final power, power deltas, moves, deaths, returns, discards, generated cards, ability triggers, banner and withdrawal timing, and control changes from the authoritative event sequence.
+
+The summary also contains final front and card snapshots, a documented main-general score, deterministic highlights, three to five turning points and a turn-indexed timeline. No connection credentials, room passwords or reconnect tokens are serialized into match history.
 
 ## Deck Submission
 
-`selectDeck` and `practice` retain `cardIds` for transport compatibility and add:
-
-```ts
-interface SubmittedDeck {
-  schemaVersion: number;
-  deckId: string;
-  name: string;
-  cardIds: string[];
-  catalogVersion: string;
-  packVersions?: Record<string, string>;
-}
-```
-
-The server resolves all card fields from its authoritative catalog. It validates exactly twelve unique known IDs, the catalog version, enabled pack versions and schema version. Client-provided cost, power, text or ability data is never accepted.
-
-## Game State
-
-Player views may include `catalogVersion`. Serialized games preserve catalog and pack versions in `setup`, together with submitted deck IDs and names when available. Reconnect, rematch, history and replay therefore use the original authoritative deck list.
-
-Card instances may include current cost, markers, statuses, usage counters, movement state and creation origin. Unrevealed or concealed opponent instances expose only the public instance identifier, owner and reveal flag.
-
-## Deterministic Resolution
-
-Abilities resolve by explicit trigger phase, descending priority, stable ability ID, deployment order and instance ID. Random selectors consume the game RNG state. Every ability and front effect emits structured start, effect and completion events. Trigger depth, repeated triggers and per-resolution event counts are bounded.
+The server resolves all card fields from its authoritative catalog. `SubmittedDeck` is validated for schema version, twelve unique known IDs, catalog version and enabled pack versions. Client-provided cost, power, text or ability data is never accepted.
 
 ## Compatibility
 
-Legacy card records containing `abilityId`, `abilityArgs`, `trigger` and `targetRule` are adapted at load time. Newly generated records use `abilities` and retain a projection of the first ability only for migration. Version 2 writers must not emit new single-ability-only records.
+Legacy `ready` and `chatMessage` actions remain accepted as migration aliases inside a joined room. New clients use `setReady`, `sendLobbyChat` and `sendRoomChat`. Compatibility aliases do not restore global-room behavior.

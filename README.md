@@ -12,10 +12,12 @@ The package has no browser, database, system-clock or network dependency. Given 
 - deterministic initiative and reveal ordering;
 - composable multi-ability resolver with 25 lifecycle triggers, 33 conditions, 28 selectors and 44 atomic effects;
 - seventy-two compatible weighted fronts with complexity, category, pack and incompatibility metadata;
+- stable front artwork keys, focal points and accessible descriptions;
 - banner stake changes, withdrawal and final scoring;
 - hidden-information player/public views;
+- deterministic post-match statistics, highlights, turning points and timeline summaries;
 - serialization, action-event replay and replay verification;
-- versioned client actions and server events.
+- versioned lobby, room, matchmaking and game protocol types with runtime validation.
 
 ## Commands
 
