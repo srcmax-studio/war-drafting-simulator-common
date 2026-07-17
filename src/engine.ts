@@ -84,9 +84,16 @@ export function getOpponent(state: GameState, playerId: PlayerId): PlayerState {
 }
 
 export function getFrontState(state: GameState, frontId: string): FrontState {
-  const found = state.fronts.find((item) => item.definition.frontId === frontId);
+  const slotMatch = /^front-slot-(\d+)$/.exec(frontId);
+  const slotIndex = slotMatch ? Number(slotMatch[1]) - 1 : -1;
+  const found = slotIndex >= 0 ? state.fronts[slotIndex] : state.fronts.find((item) => item.definition.frontId === frontId);
   if (!found) throw new RuleError('FRONT_NOT_FOUND', `Front does not exist: ${frontId}`);
   return found;
+}
+
+function canonicalFrontId(state: GameState, frontId: string): string | null {
+  try { return getFrontState(state, frontId).definition.frontId; }
+  catch { return null; }
 }
 
 function drawCards(state: GameState, owner: PlayerState, count: number): string[] {
@@ -386,16 +393,17 @@ export function validateTurnIntent(state: GameState, playerId: PlayerId, intent:
     } else {
       handCounts.set(deployment.cardId, (handCounts.get(deployment.cardId) ?? 0) - 1);
     }
-    const front = state.fronts.find((item) => item.definition.frontId === deployment.frontId);
-    if (!front) {
+    const canonicalId = canonicalFrontId(state, deployment.frontId);
+    const front = canonicalId ? state.fronts.find((item) => item.definition.frontId === canonicalId) : undefined;
+    if (!front || !canonicalId) {
       issues.push({ code: 'UNKNOWN_FRONT', message: `Unknown front: ${deployment.frontId}`, path: `deployments[${index}]` });
       continue;
     }
     const restriction = validateFrontRestriction(front.definition, card);
     if (restriction) issues.push({ ...restriction, path: `deployments[${index}]` });
-    const plannedBefore = (laneAdds.get(deployment.frontId) ?? 0) > 0;
-    totalCost += getEffectiveCost(state, card, deployment.frontId, playerId, plannedBefore);
-    laneAdds.set(deployment.frontId, (laneAdds.get(deployment.frontId) ?? 0) + 1);
+    const plannedBefore = (laneAdds.get(canonicalId) ?? 0) > 0;
+    totalCost += getEffectiveCost(state, card, canonicalId, playerId, plannedBefore);
+    laneAdds.set(canonicalId, (laneAdds.get(canonicalId) ?? 0) + 1);
   }
   if (totalCost > owner.energy) issues.push({ code: 'INSUFFICIENT_ENERGY', message: `Plan costs ${totalCost}, but only ${owner.energy} military orders are available.` });
   for (const [frontId, additions] of laneAdds) {
@@ -411,11 +419,12 @@ export function validateTurnIntent(state: GameState, playerId: PlayerId, intent:
   for (const [index, move] of (intent.moves ?? []).entries()) {
     const source = Object.values(owner.fronts).flat().find((card) => card.instanceId === move.instanceId);
     if (!source) issues.push({ code: 'INVALID_MOVE_SOURCE', message: `Card instance is not controlled by player: ${move.instanceId}`, path: `moves[${index}]` });
-    if (!state.fronts.some((front) => front.definition.frontId === move.targetFrontId)) {
+    const canonicalTargetId = canonicalFrontId(state, move.targetFrontId);
+    if (!canonicalTargetId) {
       issues.push({ code: 'INVALID_MOVE_TARGET', message: `Unknown move target: ${move.targetFrontId}`, path: `moves[${index}]` });
     }
     const origin = source ? getFrontState(state, source.frontId) : undefined;
-    const target = state.fronts.find((front) => front.definition.frontId === move.targetFrontId);
+    const target = canonicalTargetId ? state.fronts.find((front) => front.definition.frontId === canonicalTargetId) : undefined;
     if (origin?.definition.effectId === 'no_move' || target?.definition.effectId === 'no_move' || origin?.movementBlockedFor?.includes(playerId) || target?.movementBlockedFor?.includes(playerId)) {
       issues.push({ code: 'MOVEMENT_BLOCKED', message: 'This movement is blocked by a front rule.', path: `moves[${index}]` });
     }
@@ -428,9 +437,14 @@ export function submitTurnIntent(state: GameState, playerId: PlayerId, intent: T
   const result = validateTurnIntent(state, playerId, intent);
   if (!result.ok) return result;
   const owner = getPlayer(state, playerId);
-  owner.intent = clone(intent);
+  const canonicalIntent: TurnIntent = {
+    ...clone(intent),
+    deployments: intent.deployments.map((deployment) => ({ ...deployment, frontId: canonicalFrontId(state, deployment.frontId) ?? deployment.frontId })),
+    ...(intent.moves ? { moves: intent.moves.map((move) => ({ ...move, targetFrontId: canonicalFrontId(state, move.targetFrontId) ?? move.targetFrontId })) } : {})
+  };
+  owner.intent = canonicalIntent;
   state.processedRequestIds.push(intent.requestId);
-  appendEvent(state, 'turn_submitted', { intent: clone(intent) }, { playerId, public: false });
+  appendEvent(state, 'turn_submitted', { intent: clone(canonicalIntent) }, { playerId, public: false });
   appendEvent(state, 'turn_plan_updated', { playerId, deploymentCount: intent.deployments.length }, { playerId, public: false });
   return { ok: true };
 }
@@ -1169,6 +1183,37 @@ function cardView(card: CardInstance, canSee: boolean): Partial<CardInstance> & 
   return { instanceId: card.instanceId, ownerId: card.ownerId, revealed: false };
 }
 
+function hiddenFrontDefinition(index: number): FrontDefinition {
+  return {
+    frontId: `front-slot-${index + 1}`,
+    nameZh: '未揭示战线',
+    nameEn: 'Unrevealed Front',
+    descriptionZh: '该战线尚未揭示。',
+    descriptionEn: 'This front has not been revealed.',
+    effectId: 'hidden',
+    effectArgs: {},
+    enabled: true,
+    weight: 1,
+    complexity: 'simple',
+    categories: ['hidden'],
+    minimumClientVersion: PROTOCOL_VERSION,
+    packId: 'core',
+    tags: ['hidden'],
+    strategyZh: '根据未知规则评估投入风险。'
+  };
+}
+
+function redactHiddenFrontReferences(state: GameState, value: unknown): unknown {
+  const replacements = new Map(state.fronts.map((front, index) => [front.definition.frontId, front.revealed ? front.definition.frontId : `front-slot-${index + 1}`]));
+  const visit = (item: unknown): unknown => {
+    if (typeof item === 'string') return replacements.get(item) ?? item;
+    if (Array.isArray(item)) return item.map(visit);
+    if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, visit(entry)]));
+    return item;
+  };
+  return visit(value);
+}
+
 function buildView(state: GameState, perspective?: PlayerId): PlayerView {
   const ended = state.phase === 'ended';
   return {
@@ -1179,17 +1224,22 @@ function buildView(state: GameState, perspective?: PlayerId): PlayerView {
     sequence: state.sequence,
     initiativePlayerId: state.initiativePlayerId,
     ...(state.setup.catalogVersion ? { catalogVersion: state.setup.catalogVersion } : {}),
-    fronts: state.fronts.map((front) => {
+    fronts: state.fronts.map((front, frontIndex) => {
       const frontId = front.definition.frontId;
+      const publicFrontId = front.revealed || ended ? frontId : `front-slot-${frontIndex + 1}`;
       const cards: PlayerView['fronts'][number]['cards'] = {};
       const power: Record<PlayerId, number | null> = {};
       for (const owner of state.players) {
         const concealsLane = front.definition.effectId === 'concealed_lane' && !ended && owner.playerId !== perspective;
-        cards[owner.playerId] = (owner.fronts[frontId] ?? []).map((card) => cardView(card, !concealsLane && (ended || owner.playerId === perspective || card.revealed)));
+        cards[owner.playerId] = (owner.fronts[frontId] ?? []).map((card) => {
+          const result = cardView(card, !concealsLane && (ended || owner.playerId === perspective || card.revealed));
+          if (!front.revealed && result.frontId) result.frontId = publicFrontId;
+          return result;
+        });
         const hidesPower = ['hidden_power', 'concealed_lane'].includes(front.definition.effectId) && !ended && owner.playerId !== perspective;
         power[owner.playerId] = front.revealed && !hidesPower ? calculateFrontPower(state, owner.playerId, frontId) : null;
       }
-      const result: PlayerView['fronts'][number] = { definition: clone(front.definition), revealed: front.revealed, cards, power };
+      const result: PlayerView['fronts'][number] = { definition: front.revealed || ended ? clone(front.definition) : hiddenFrontDefinition(frontIndex), revealed: front.revealed, cards, power };
       if (front.revealedTurn !== undefined) result.revealedTurn = front.revealedTurn;
       return result;
     }),
@@ -1210,7 +1260,7 @@ function buildView(state: GameState, perspective?: PlayerId): PlayerView {
     }),
     stake: clone(state.stake),
     winner: clone(state.winner),
-    events: state.eventLog.filter((event) => event.public || event.playerId === perspective).map(clone)
+    events: state.eventLog.filter((event) => event.public || event.playerId === perspective).map((event) => redactHiddenFrontReferences(state, clone(event)) as GameEvent)
   };
 }
 

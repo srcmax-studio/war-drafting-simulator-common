@@ -412,6 +412,27 @@ describe('stake, privacy and replay', () => {
     expect(createPublicView(state).players.every((player) => player.hand === undefined)).toBe(true);
   });
 
+  it('redacts unrevealed front identities and effect metadata', () => {
+    const state = makeGame(777);
+    const hidden = state.fronts[1]!;
+    expect(hidden.revealed).toBe(false);
+    const view = createPlayerView(state, 'p1');
+    expect(view.fronts[1]!.definition.frontId).toBe('front-slot-2');
+    expect(view.fronts[1]!.definition.effectId).toBe('hidden');
+    expect(JSON.stringify(view.events)).not.toContain(hidden.definition.frontId);
+  });
+
+  it('canonicalizes hidden front slot aliases before recording a turn plan', () => {
+    const state = makeGame(778);
+    const owner = state.players[0];
+    const card = cards[0]!;
+    owner.hand = [card.cardId];
+    owner.energy = 6;
+    const result = submitTurnIntent(state, 'p1', { requestId: 'hidden-slot-plan', turn: state.turn, deployments: [{ cardId: card.cardId, frontId: 'front-slot-2', order: 0 }] });
+    expect(result).toEqual({ ok: true });
+    expect(owner.intent?.deployments[0]?.frontId).toBe(state.fronts[1]!.definition.frontId);
+  });
+
   it('does not expose an opponent turn plan or deployment count', () => {
     const state = makeGame();
     submitTurnIntent(state, 'p1', { requestId: 'private-plan', turn: 1, deployments: [] });
