@@ -327,8 +327,10 @@ function beginTurn(state: GameState): void {
 }
 
 export function getEffectiveCost(state: GameState, card: CardDefinition, frontId: string, playerId?: PlayerId, plannedBefore = false): number {
-  const front = getFrontState(state, frontId).definition;
+  const frontState = getFrontState(state, frontId);
+  const front = frontState.definition;
   let result = card.cost;
+  if (!frontState.revealed) return result;
   if (front.effectId === 'cost_down') result -= asNumber(front.effectArgs?.amount, 1);
   if (front.effectId === 'cost_up') result += asNumber(front.effectArgs?.amount, 1);
   if (front.effectId === 'future_beacon' && card.era === asString(front.effectArgs?.era, '未来时代')) result -= asNumber(front.effectArgs?.cost, 1);
@@ -347,9 +349,9 @@ export function getEffectiveCost(state: GameState, card: CardDefinition, frontId
 export function getFrontCapacity(state: GameState, playerId: PlayerId, frontId: string): number {
   const front = getFrontState(state, frontId);
   let capacity = DEFAULT_FRONT_CAPACITY;
-  if (front.definition.effectId === 'capacity_up') capacity += asNumber(front.definition.effectArgs?.amount, 1);
-  if (front.definition.effectId === 'capacity_down') capacity -= asNumber(front.definition.effectArgs?.amount, 1);
-  if (front.definition.effectId === 'capacity_by_turn') {
+  if (front.revealed && front.definition.effectId === 'capacity_up') capacity += asNumber(front.definition.effectArgs?.amount, 1);
+  if (front.revealed && front.definition.effectId === 'capacity_down') capacity -= asNumber(front.definition.effectArgs?.amount, 1);
+  if (front.revealed && front.definition.effectId === 'capacity_by_turn') {
     const turns = Array.isArray(front.definition.effectArgs?.turns) ? front.definition.effectArgs.turns.map(Number) : [3, 5];
     capacity += turns.filter((turn) => state.turn >= turn).length * asNumber(front.definition.effectArgs?.amount, 1);
   }
@@ -359,12 +361,13 @@ export function getFrontCapacity(state: GameState, playerId: PlayerId, frontId: 
   return Math.max(1, Math.floor(capacity));
 }
 
-function validateFrontRestriction(front: FrontDefinition, card: CardDefinition): ValidationIssue | null {
-  if (front.effectId === 'ban_high_cost' && card.cost >= asNumber(front.effectArgs?.threshold, 4)) {
-    return { code: 'HIGH_COST_BLOCKED', message: `${card.nameZh} cannot be deployed to ${front.nameZh}.` };
+function validateFrontRestriction(front: FrontState, card: CardDefinition): ValidationIssue | null {
+  if (!front.revealed) return null;
+  if (front.definition.effectId === 'ban_high_cost' && card.cost >= asNumber(front.definition.effectArgs?.threshold, 4)) {
+    return { code: 'HIGH_COST_BLOCKED', message: `${card.nameZh} cannot be deployed to ${front.definition.nameZh}.` };
   }
-  if (front.effectId === 'ban_low_cost' && card.cost <= asNumber(front.effectArgs?.threshold, 2)) {
-    return { code: 'LOW_COST_BLOCKED', message: `${card.nameZh} cannot be deployed to ${front.nameZh}.` };
+  if (front.definition.effectId === 'ban_low_cost' && card.cost <= asNumber(front.definition.effectArgs?.threshold, 2)) {
+    return { code: 'LOW_COST_BLOCKED', message: `${card.nameZh} cannot be deployed to ${front.definition.nameZh}.` };
   }
   return null;
 }
@@ -399,7 +402,7 @@ export function validateTurnIntent(state: GameState, playerId: PlayerId, intent:
       issues.push({ code: 'UNKNOWN_FRONT', message: `Unknown front: ${deployment.frontId}`, path: `deployments[${index}]` });
       continue;
     }
-    const restriction = validateFrontRestriction(front.definition, card);
+    const restriction = validateFrontRestriction(front, card);
     if (restriction) issues.push({ ...restriction, path: `deployments[${index}]` });
     const plannedBefore = (laneAdds.get(canonicalId) ?? 0) > 0;
     totalCost += getEffectiveCost(state, card, canonicalId, playerId, plannedBefore);
@@ -522,7 +525,7 @@ function deployCards(state: GameState, owner: PlayerState, intent: TurnIntent): 
       appendEvent(state, 'deployment_fizzled', { playerId: owner.playerId, cardId: deployment.cardId, frontId: deployment.frontId, reason: 'front_capacity' });
       continue;
     }
-    if (validateFrontRestriction(front.definition, definition)) {
+    if (validateFrontRestriction(front, definition)) {
       appendEvent(state, 'deployment_fizzled', { playerId: owner.playerId, cardId: deployment.cardId, frontId: deployment.frontId, reason: 'front_restriction' });
       continue;
     }
@@ -535,7 +538,7 @@ function deployCards(state: GameState, owner: PlayerState, intent: TurnIntent): 
     owner.energy = Math.max(0, owner.energy - cost);
     owner.hand.splice(handIndex, 1);
     const abilities = getCardAbilities(definition);
-    const delayed = abilities.some((ability) => ability.abilityId === 'ambush') || ['delayed_reveal', 'reverse_reveal'].includes(front.definition.effectId);
+    const delayed = abilities.some((ability) => ability.abilityId === 'ambush') || front.revealed && ['delayed_reveal', 'reverse_reveal'].includes(front.definition.effectId);
     const source: CardInstance = {
       instanceId: `${state.gameId}-${state.nextInstanceId}`,
       cardId: definition.cardId,
@@ -544,7 +547,7 @@ function deployCards(state: GameState, owner: PlayerState, intent: TurnIntent): 
       frontId: deployment.frontId,
       currentCost: definition.cost,
       revealed: false,
-      silenced: front.definition.effectId === 'silence',
+      silenced: front.revealed && front.definition.effectId === 'silence',
       deployedTurn: state.turn,
       modifiers: [],
       markers: {},
@@ -567,19 +570,19 @@ function deployCards(state: GameState, owner: PlayerState, intent: TurnIntent): 
     runCardTrigger(state, owner, source, source.cardId, 'on_play', { instanceId: source.instanceId, playerId: owner.playerId, frontId: source.frontId });
     if (!delayed) {
       revealCard(state, owner, source);
-      if (front.definition.effectId === 'repeat_reveal') runCardTrigger(state, owner, source, source.cardId, 'on_deploy');
+      if (front.revealed && front.definition.effectId === 'repeat_reveal') runCardTrigger(state, owner, source, source.cardId, 'on_deploy');
     }
-    if (front.definition.effectId === 'first_play_bonus' && (owner.fronts[source.frontId] ?? []).filter((card) => card.deployedTurn === state.turn).length === 1) {
+    if (front.revealed && front.definition.effectId === 'first_play_bonus' && (owner.fronts[source.frontId] ?? []).filter((card) => card.deployedTurn === state.turn).length === 1) {
       const bonus = asNumber(front.definition.effectArgs?.amount, 2);
       source.currentPower += bonus;
       source.modifiers.push({ source: `front:${source.frontId}:first`, amount: bonus });
     }
-    if (front.definition.effectId === 'last_slot_bonus' && (owner.fronts[source.frontId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, source.frontId)) {
+    if (front.revealed && front.definition.effectId === 'last_slot_bonus' && (owner.fronts[source.frontId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, source.frontId)) {
       const bonus = asNumber(front.definition.effectArgs?.amount, 4);
       source.currentPower += bonus;
       source.modifiers.push({ source: `front:${source.frontId}:last`, amount: bonus });
     }
-    if (front.definition.effectId === 'modern_exchange' && (front.definition.effectArgs?.eras as unknown[] | undefined)?.includes(definition.era)) {
+    if (front.revealed && front.definition.effectId === 'modern_exchange' && (front.definition.effectArgs?.eras as unknown[] | undefined)?.includes(definition.era)) {
       front.state ??= {};
       const key = `drawn:${owner.playerId}`;
       if (!front.state[key]) { front.state[key] = true; drawCards(state, owner, asNumber(front.definition.effectArgs?.count, 1)); }

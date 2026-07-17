@@ -458,6 +458,20 @@ describe('stake, privacy and replay', () => {
     expect(owner.intent?.deployments[0]?.frontId).toBe(state.fronts[1]!.definition.frontId);
   });
 
+  it('does not enforce a hidden front restriction before reveal', () => {
+    const state = makeGame(779);
+    const owner = state.players[0];
+    const card = cards.find((candidate) => candidate.cost >= 4)!;
+    owner.hand = [card.cardId];
+    owner.energy = 6;
+    state.fronts[1]!.definition = FRONT_DEFINITIONS.find((front) => front.effectId === 'ban_high_cost')!;
+    state.fronts[1]!.revealed = false;
+    const intent: TurnIntent = { requestId: 'hidden-restriction', turn: state.turn, deployments: [{ cardId: card.cardId, frontId: 'front-slot-2', order: 0 }] };
+    expect(validateTurnIntent(state, 'p1', intent)).toEqual({ ok: true });
+    state.fronts[1]!.revealed = true;
+    expect(validateTurnIntent(state, 'p1', { ...intent, deployments: [{ ...intent.deployments[0]!, frontId: state.fronts[1]!.definition.frontId }] }).ok).toBe(false);
+  });
+
   it('does not expose an opponent turn plan or deployment count', () => {
     const state = makeGame();
     submitTurnIntent(state, 'p1', { requestId: 'private-plan', turn: 1, deployments: [] });
