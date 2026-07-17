@@ -179,6 +179,11 @@ describe.each(ABILITY_DEFINITIONS)('ability $abilityId', (ability) => {
 });
 
 describe('game lifecycle', () => {
+  it('accepts JSON-compatible proxy-like catalog input', () => {
+    const proxiedCards = makeOptions().cards.map((card) => new Proxy(card, {}));
+    expect(createGame({ ...makeOptions(), cards: proxiedCards }).cardCatalog['af-card-0']?.nameZh).toBe('角色0');
+  });
+
   it('creates a versioned game with three unique fronts', () => {
     const state = makeGame();
     expect(state.protocolVersion).toBe(PROTOCOL_VERSION);

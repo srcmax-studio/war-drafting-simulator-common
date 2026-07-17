@@ -25,7 +25,10 @@ import {
 } from './types.js';
 import { validateCardDefinitions, validateDeck } from './validation.js';
 
-const clone = <T>(value: T): T => structuredClone(value);
+const clone = <T>(value: T): T => {
+  if (value === undefined) return value;
+  return JSON.parse(JSON.stringify(value)) as T;
+};
 
 const asNumber = (value: unknown, fallback: number): number =>
   typeof value === 'number' && Number.isFinite(value) ? value : fallback;
