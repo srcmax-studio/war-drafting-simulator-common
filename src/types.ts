@@ -505,6 +505,9 @@ export interface PlayerView {
     revealedTurn?: number;
     cards: Record<PlayerId, Array<Partial<CardInstance> & Pick<CardInstance, 'instanceId' | 'ownerId' | 'revealed'>>>;
     power: Record<PlayerId, number | null>;
+    capacity: Record<PlayerId, number>;
+    deploymentBlocked: Record<PlayerId, boolean>;
+    movementBlocked: Record<PlayerId, boolean>;
   }>;
   players: Array<{
     playerId: PlayerId;

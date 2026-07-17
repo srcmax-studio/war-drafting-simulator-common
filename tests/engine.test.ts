@@ -437,6 +437,17 @@ describe('stake, privacy and replay', () => {
     expect(createPublicView(state).players.every((player) => player.hand === undefined)).toBe(true);
   });
 
+  it('publishes per-player capacity and lock state without private data', () => {
+    const state = makeGame(776);
+    const front = state.fronts[0]!;
+    front.blockedFor = ['p1'];
+    front.movementBlockedFor = ['p2'];
+    const view = createPlayerView(state, 'p1');
+    expect(view.fronts[0]!.capacity.p1).toBe(0);
+    expect(view.fronts[0]!.deploymentBlocked.p1).toBe(true);
+    expect(view.fronts[0]!.movementBlocked.p2).toBe(true);
+  });
+
   it('redacts unrevealed front identities and effect metadata', () => {
     const state = makeGame(777);
     const hidden = state.fronts[1]!;

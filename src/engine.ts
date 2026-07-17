@@ -1248,6 +1248,9 @@ function buildView(state: GameState, perspective?: PlayerId): PlayerView {
       const publicFrontId = front.revealed || ended ? frontId : `front-slot-${frontIndex + 1}`;
       const cards: PlayerView['fronts'][number]['cards'] = {};
       const power: Record<PlayerId, number | null> = {};
+      const capacity: Record<PlayerId, number> = {};
+      const deploymentBlocked: Record<PlayerId, boolean> = {};
+      const movementBlocked: Record<PlayerId, boolean> = {};
       for (const owner of state.players) {
         const concealsLane = front.definition.effectId === 'concealed_lane' && !ended && owner.playerId !== perspective;
         cards[owner.playerId] = (owner.fronts[frontId] ?? []).map((card) => {
@@ -1257,8 +1260,11 @@ function buildView(state: GameState, perspective?: PlayerId): PlayerView {
         });
         const hidesPower = ['hidden_power', 'concealed_lane'].includes(front.definition.effectId) && !ended && owner.playerId !== perspective;
         power[owner.playerId] = front.revealed && !hidesPower ? calculateFrontPower(state, owner.playerId, frontId) : null;
+        capacity[owner.playerId] = getFrontCapacity(state, owner.playerId, frontId);
+        deploymentBlocked[owner.playerId] = capacity[owner.playerId] === 0;
+        movementBlocked[owner.playerId] = front.definition.effectId === 'no_move' || front.movementBlockedFor?.includes(owner.playerId) === true;
       }
-      const result: PlayerView['fronts'][number] = { definition: front.revealed || ended ? clone(front.definition) : hiddenFrontDefinition(frontIndex), revealed: front.revealed, cards, power };
+      const result: PlayerView['fronts'][number] = { definition: front.revealed || ended ? clone(front.definition) : hiddenFrontDefinition(frontIndex), revealed: front.revealed, cards, power, capacity, deploymentBlocked, movementBlocked };
       if (front.revealedTurn !== undefined) result.revealedTurn = front.revealedTurn;
       return result;
     }),
