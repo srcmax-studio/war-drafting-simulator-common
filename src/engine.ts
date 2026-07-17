@@ -1,5 +1,5 @@
-import { ABILITY_REGISTRY, resolveAbility } from './abilities.js';
-import { FRONT_DEFINITIONS, validateFrontDefinitions } from './fronts.js';
+import { getCardAbilities, normalizeTrigger, ongoingPowerAdjustments, resolveAbility } from './abilities.js';
+import { FRONT_DEFINITIONS, areFrontsCompatible, validateFrontDefinitions } from './fronts.js';
 import { SeededRandom } from './rng.js';
 import {
   DEFAULT_FRONT_CAPACITY,
@@ -42,6 +42,9 @@ function appendEvent(
   payload: Record<string, unknown>,
   options: { playerId?: PlayerId; public?: boolean } = {}
 ): GameEvent {
+  if ((state.resolutionEventCount ?? 0) >= MAX_EVENTS_PER_RESOLUTION) {
+    throw new RuleError('EVENT_LIMIT_EXCEEDED', 'Resolution event limit exceeded.');
+  }
   if (state.eventLog.length >= MAX_EVENTS_PER_RESOLUTION * STANDARD_TURNS * 4) {
     throw new RuleError('EVENT_LIMIT_EXCEEDED', 'Game event limit exceeded.');
   }
@@ -55,6 +58,7 @@ function appendEvent(
   };
   if (options.playerId !== undefined) event.playerId = options.playerId;
   state.eventLog.push(event);
+  state.resolutionEventCount = (state.resolutionEventCount ?? 0) + 1;
   return event;
 }
 
@@ -88,21 +92,31 @@ export function getFrontState(state: GameState, frontId: string): FrontState {
 function drawCards(state: GameState, owner: PlayerState, count: number): string[] {
   const drawn = owner.deck.splice(0, Math.max(0, count));
   owner.hand.push(...drawn);
+  owner.counters ??= { deployments: 0, moves: 0, deaths: 0, discards: 0, cardsDrawn: 0 };
+  owner.counters.cardsDrawn += drawn.length;
   if (drawn.length > 0) {
     appendEvent(state, 'cards_drawn', { count: drawn.length, cardIds: [...drawn] }, { playerId: owner.playerId, public: false });
     appendEvent(state, 'opponent_drew', { count: drawn.length, playerId: owner.playerId });
   }
+  for (const cardId of drawn) runCardTrigger(state, owner, undefined, cardId, 'on_draw');
   return drawn;
 }
 
 function selectFronts(rng: SeededRandom, fronts: readonly FrontDefinition[]): FrontDefinition[] {
   const enabled = fronts.filter((item) => item.enabled && item.weight > 0);
   if (enabled.length < 3) throw new RuleError('INSUFFICIENT_FRONTS', 'At least three fronts must be enabled.');
-  const pool = enabled.flatMap((item) => Array.from({ length: Math.max(1, Math.floor(item.weight)) }, () => item));
   const selected: FrontDefinition[] = [];
   while (selected.length < 3) {
-    const candidate = rng.pick(pool);
-    if (!selected.some((item) => item.frontId === candidate.frontId)) selected.push(clone(candidate));
+    const compatible = enabled.filter((candidate) => !selected.some((item) => item.frontId === candidate.frontId) && areFrontsCompatible(selected, candidate));
+    if (compatible.length === 0) throw new RuleError('INCOMPATIBLE_FRONT_POOL', 'Front pool cannot produce three compatible fronts.');
+    const total = compatible.reduce((sum, candidate) => sum + candidate.weight, 0);
+    let roll = rng.next() * total;
+    let candidate = compatible.at(-1)!;
+    for (const item of compatible) {
+      roll -= item.weight;
+      if (roll <= 0) { candidate = item; break; }
+    }
+    selected.push(clone(candidate));
   }
   return selected;
 }
@@ -119,7 +133,10 @@ function createPlayerState(
     hand: [],
     fronts: Object.fromEntries(frontIds.map((frontId) => [frontId, []])) as Record<string, CardInstance[]>,
     graveyard: [],
+    discarded: [],
     energy: 1,
+    storedEnergy: 0,
+    counters: { deployments: 0, moves: 0, deaths: 0, discards: 0, cardsDrawn: 0 },
     locked: false,
     bannerUsed: false,
     withdrawn: false
@@ -162,11 +179,15 @@ export function createGame(options: GameOptions): GameState {
     eventLog: [],
     processedRequestIds: [],
     cardCatalog,
+    abilityStack: [],
+    resolutionEventCount: 0,
     setup: {
       seed: options.seed >>> 0,
       cards: clone(options.cards),
       fronts: clone(options.fronts),
-      players: clone(options.players)
+      players: clone(options.players),
+      ...(options.catalogVersion ? { catalogVersion: options.catalogVersion } : {}),
+      ...(options.packVersions ? { packVersions: clone(options.packVersions) } : {})
     }
   };
   state.rngState = rng.getState();
@@ -176,12 +197,45 @@ export function createGame(options: GameOptions): GameState {
   return state;
 }
 
+function runCardTrigger(
+  state: GameState,
+  owner: PlayerState,
+  source: CardInstance | undefined,
+  cardId: string,
+  trigger: AbilityTrigger,
+  triggering: { instanceId?: string; playerId?: string; frontId?: string } = {}
+): void {
+  const definition = state.cardCatalog[cardId];
+  if (!definition || source?.silenced) return;
+  const abilities = getCardAbilities(definition)
+    .filter((ability) => normalizeTrigger(ability.trigger) === trigger)
+    .sort((left, right) => (right.priority ?? 0) - (left.priority ?? 0) || left.abilityId.localeCompare(right.abilityId));
+  for (const ability of abilities) {
+    const events = resolveAbility({
+      gameState: state,
+      ability,
+      sourceCardId: cardId,
+      sourceInstanceId: source?.instanceId ?? `zone-${owner.playerId}-${cardId}-${state.sequence}`,
+      sourcePlayerId: owner.playerId,
+      ...(source?.frontId ? { sourceFrontId: source.frontId } : {}),
+      ...(triggering.instanceId ? { triggeringInstanceId: triggering.instanceId } : {}),
+      ...(triggering.playerId ? { triggeringPlayerId: triggering.playerId } : {}),
+      ...(triggering.frontId ? { triggeringFrontId: triggering.frontId } : {}),
+      turn: state.turn,
+      eventQueue: [],
+      depth: 0
+    });
+    flushAbilityEvents(state, events);
+  }
+}
+
 function revealCard(state: GameState, owner: PlayerState, card: CardInstance): void {
   if (card.revealed) return;
   card.revealed = true;
   appendEvent(state, 'card_revealed', { playerId: owner.playerId, instanceId: card.instanceId, cardId: card.cardId, frontId: card.frontId });
-  const definition = state.cardCatalog[card.cardId];
-  if (definition?.trigger === 'deploy' && !card.silenced) runAbility(state, owner, card);
+  runCardTrigger(state, owner, card, card.cardId, 'on_reveal');
+  runCardTrigger(state, owner, card, card.cardId, 'after_reveal');
+  runCardTrigger(state, owner, card, card.cardId, 'on_deploy');
 }
 
 function revealDelayedCards(state: GameState): void {
@@ -208,30 +262,54 @@ function applyPendingStake(state: GameState): void {
 }
 
 function revealScheduledFronts(state: GameState): void {
-  const index = Math.min(state.turn - 1, 2);
+  const scheduled = Math.min(state.turn - 1, 2);
+  const lateIndex = state.fronts.findIndex((item) => item.definition.effectId === 'late_front_reveal');
+  const index = scheduled === lateIndex && state.turn < asNumber(state.fronts[lateIndex]?.definition.effectArgs?.turn, 4) ? -1 : scheduled;
   const front = state.fronts[index];
-  if (front && !front.revealed) {
-    front.revealed = true;
-    front.revealedTurn = state.turn;
-    appendEvent(state, 'front_revealed', { frontId: front.definition.frontId, index });
-  }
+  if (front && !front.revealed) revealFront(state, front, index);
   if (state.turn >= 2 && state.fronts.some((item) => item.definition.effectId === 'early_reveal')) {
     const third = state.fronts[2];
-    if (third && !third.revealed) {
-      third.revealed = true;
-      third.revealedTurn = state.turn;
-      appendEvent(state, 'front_revealed', { frontId: third.definition.frontId, index: 2, early: true });
+    if (third && !third.revealed) revealFront(state, third, 2, { early: true });
+  }
+  if (state.turn >= 2 && state.fronts.some((item) => item.definition.effectId === 'reveal_all_early')) {
+    state.fronts.forEach((candidate, candidateIndex) => {
+      if (!candidate.revealed) revealFront(state, candidate, candidateIndex, { early: true });
+    });
+  }
+  if (state.turn >= 4 && lateIndex >= 0) {
+    const late = state.fronts[lateIndex];
+    if (late && !late.revealed) revealFront(state, late, lateIndex);
+  }
+}
+
+function revealFront(state: GameState, front: FrontState, index: number, payload: Record<string, unknown> = {}): void {
+  front.revealed = true;
+  front.revealedTurn = state.turn;
+  appendEvent(state, 'front_revealed', { frontId: front.definition.frontId, index, ...payload });
+  runBoardTrigger(state, 'on_front_revealed', { frontId: front.definition.frontId });
+}
+
+function expireTemporaryModifiers(state: GameState): void {
+  for (const owner of state.players) {
+    for (const card of Object.values(owner.fronts).flat()) {
+      const expired = card.modifiers.filter((modifier) => modifier.expiresTurn !== undefined && modifier.expiresTurn < state.turn);
+      if (expired.length > 0) card.currentPower -= expired.reduce((sum, modifier) => sum + modifier.amount, 0);
+      card.modifiers = card.modifiers.filter((modifier) => modifier.expiresTurn === undefined || modifier.expiresTurn >= state.turn);
+      if (card.statuses) card.statuses = card.statuses.filter((status) => !status.startsWith('turn:'));
     }
   }
 }
 
 function beginTurn(state: GameState): void {
   state.phase = 'planning';
+  state.resolutionEventCount = 0;
+  expireTemporaryModifiers(state);
   applyPendingStake(state);
   revealScheduledFronts(state);
   revealDelayedCards(state);
   for (const owner of state.players) {
-    owner.energy = state.turn;
+    owner.energy = state.turn + (owner.storedEnergy ?? 0);
+    owner.storedEnergy = 0;
     owner.locked = false;
     delete owner.intent;
     drawCards(state, owner, 1);
@@ -241,11 +319,21 @@ function beginTurn(state: GameState): void {
   appendEvent(state, 'turn_started', { turn: state.turn, initiativePlayerId: state.initiativePlayerId, energy: state.turn });
 }
 
-export function getEffectiveCost(state: GameState, card: CardDefinition, frontId: string): number {
+export function getEffectiveCost(state: GameState, card: CardDefinition, frontId: string, playerId?: PlayerId, plannedBefore = false): number {
   const front = getFrontState(state, frontId).definition;
   let result = card.cost;
   if (front.effectId === 'cost_down') result -= asNumber(front.effectArgs?.amount, 1);
   if (front.effectId === 'cost_up') result += asNumber(front.effectArgs?.amount, 1);
+  if (front.effectId === 'future_beacon' && card.era === asString(front.effectArgs?.era, '未来时代')) result -= asNumber(front.effectArgs?.cost, 1);
+  if (front.effectId === 'hand_cost_down' && card.cost >= asNumber(front.effectArgs?.threshold, 4)) result -= asNumber(front.effectArgs?.amount, 1);
+  if (front.effectId === 'low_cost_surcharge' && card.cost <= asNumber(front.effectArgs?.threshold, 2)) result += asNumber(front.effectArgs?.amount, 1);
+  if (front.effectId === 'final_turn_discount' && state.turn === asNumber(front.effectArgs?.turn, STANDARD_TURNS)) result -= asNumber(front.effectArgs?.amount, 2);
+  if (playerId && ['high_cost_discount', 'first_card_discount'].includes(front.effectId)) {
+    const alreadyPlayed = plannedBefore || (getPlayer(state, playerId).fronts[frontId] ?? []).some((instance) => instance.deployedTurn === state.turn);
+    if (!alreadyPlayed && (front.effectId !== 'high_cost_discount' || card.cost >= asNumber(front.effectArgs?.threshold, 5))) {
+      result -= asNumber(front.effectArgs?.amount, front.effectId === 'high_cost_discount' ? 2 : 1);
+    }
+  }
   return Math.max(1, Math.floor(result));
 }
 
@@ -254,7 +342,13 @@ export function getFrontCapacity(state: GameState, playerId: PlayerId, frontId: 
   let capacity = DEFAULT_FRONT_CAPACITY;
   if (front.definition.effectId === 'capacity_up') capacity += asNumber(front.definition.effectArgs?.amount, 1);
   if (front.definition.effectId === 'capacity_down') capacity -= asNumber(front.definition.effectArgs?.amount, 1);
-  if (front.blockedFor === playerId) return 0;
+  if (front.definition.effectId === 'capacity_by_turn') {
+    const turns = Array.isArray(front.definition.effectArgs?.turns) ? front.definition.effectArgs.turns.map(Number) : [3, 5];
+    capacity += turns.filter((turn) => state.turn >= turn).length * asNumber(front.definition.effectArgs?.amount, 1);
+  }
+  capacity += front.capacityModifiers?.[playerId] ?? 0;
+  const blocked = Array.isArray(front.blockedFor) ? front.blockedFor : front.blockedFor ? [front.blockedFor] : [];
+  if (blocked.includes(playerId)) return 0;
   return Math.max(1, Math.floor(capacity));
 }
 
@@ -299,7 +393,8 @@ export function validateTurnIntent(state: GameState, playerId: PlayerId, intent:
     }
     const restriction = validateFrontRestriction(front.definition, card);
     if (restriction) issues.push({ ...restriction, path: `deployments[${index}]` });
-    totalCost += getEffectiveCost(state, card, deployment.frontId);
+    const plannedBefore = (laneAdds.get(deployment.frontId) ?? 0) > 0;
+    totalCost += getEffectiveCost(state, card, deployment.frontId, playerId, plannedBefore);
     laneAdds.set(deployment.frontId, (laneAdds.get(deployment.frontId) ?? 0) + 1);
   }
   if (totalCost > owner.energy) issues.push({ code: 'INSUFFICIENT_ENERGY', message: `Plan costs ${totalCost}, but only ${owner.energy} military orders are available.` });
@@ -308,12 +403,21 @@ export function validateTurnIntent(state: GameState, playerId: PlayerId, intent:
     if (occupied + additions > getFrontCapacity(state, playerId, frontId)) {
       issues.push({ code: 'FRONT_CAPACITY', message: `${frontId} does not have enough capacity.` });
     }
+    const definition = getFrontState(state, frontId).definition;
+    if (definition.effectId === 'single_deploy' && additions > asNumber(definition.effectArgs?.count, 1)) {
+      issues.push({ code: 'FRONT_DEPLOYMENT_LIMIT', message: `${frontId} accepts only one deployment per turn.` });
+    }
   }
   for (const [index, move] of (intent.moves ?? []).entries()) {
     const source = Object.values(owner.fronts).flat().find((card) => card.instanceId === move.instanceId);
     if (!source) issues.push({ code: 'INVALID_MOVE_SOURCE', message: `Card instance is not controlled by player: ${move.instanceId}`, path: `moves[${index}]` });
     if (!state.fronts.some((front) => front.definition.frontId === move.targetFrontId)) {
       issues.push({ code: 'INVALID_MOVE_TARGET', message: `Unknown move target: ${move.targetFrontId}`, path: `moves[${index}]` });
+    }
+    const origin = source ? getFrontState(state, source.frontId) : undefined;
+    const target = state.fronts.find((front) => front.definition.frontId === move.targetFrontId);
+    if (origin?.definition.effectId === 'no_move' || target?.definition.effectId === 'no_move' || origin?.movementBlockedFor?.includes(playerId) || target?.movementBlockedFor?.includes(playerId)) {
+      issues.push({ code: 'MOVEMENT_BLOCKED', message: 'This movement is blocked by a front rule.', path: `moves[${index}]` });
     }
   }
   return issues.length === 0 ? { ok: true } : { ok: false, issues };
@@ -357,35 +461,34 @@ function movePlannedCards(state: GameState, owner: PlayerState, intent: TurnInte
     if (!moving || !sourceFrontId || sourceFrontId === move.targetFrontId) continue;
     const target = owner.fronts[move.targetFrontId];
     if (!target || target.length >= getFrontCapacity(state, owner.playerId, move.targetFrontId)) continue;
+    runCardTrigger(state, owner, moving, moving.cardId, 'before_move', { instanceId: moving.instanceId, playerId: owner.playerId, frontId: move.targetFrontId });
     owner.fronts[sourceFrontId] = owner.fronts[sourceFrontId]!.filter((card) => card.instanceId !== moving?.instanceId);
     moving.frontId = move.targetFrontId;
+    moving.moved = true;
     target.push(moving);
+    owner.counters ??= { deployments: 0, moves: 0, deaths: 0, discards: 0, cardsDrawn: 0 };
+    owner.counters.moves += 1;
     appendEvent(state, 'card_moved', { playerId: owner.playerId, instanceId: moving.instanceId, from: sourceFrontId, to: move.targetFrontId });
+    runCardTrigger(state, owner, moving, moving.cardId, 'after_move', { instanceId: moving.instanceId, playerId: owner.playerId, frontId: sourceFrontId });
   }
 }
 
-function runAbility(state: GameState, owner: PlayerState, source: CardInstance): void {
-  if (source.silenced || !source.revealed) return;
-  const events = resolveAbility({
-    gameState: state,
-    sourceCardId: source.cardId,
-    sourceInstanceId: source.instanceId,
-    sourcePlayerId: owner.playerId,
-    sourceFrontId: source.frontId,
-    turn: state.turn,
-    eventQueue: [],
-    depth: 0
-  });
-  flushAbilityEvents(state, events);
-}
-
-function runBoardTrigger(state: GameState, trigger: AbilityTrigger): void {
+function runBoardTrigger(state: GameState, trigger: AbilityTrigger, triggering: { instanceId?: string; playerId?: string; frontId?: string } = {}): void {
   const snapshot = state.players.flatMap((owner) =>
     Object.values(owner.fronts).flatMap((cards) => cards.map((card) => ({ owner, card })))
-  );
+  ).sort((left, right) => left.card.deployedTurn - right.card.deployedTurn || left.card.instanceId.localeCompare(right.card.instanceId));
   for (const { owner, card } of snapshot) {
-    const definition = state.cardCatalog[card.cardId];
-    if (definition?.trigger === trigger && card.revealed && !card.silenced) runAbility(state, owner, card);
+    if (card.revealed && !card.silenced) runCardTrigger(state, owner, card, card.cardId, trigger, triggering);
+  }
+}
+
+function runPlayedReactions(state: GameState, playedOwner: PlayerState, source: CardInstance): void {
+  const snapshot = state.players.flatMap((owner) => Object.values(owner.fronts).flatMap((cards) => cards.map((card) => ({ owner, card }))));
+  for (const candidate of snapshot) {
+    if (candidate.card.instanceId === source.instanceId || !candidate.card.revealed || candidate.card.silenced) continue;
+    const triggering = { instanceId: source.instanceId, playerId: playedOwner.playerId, frontId: source.frontId };
+    if (candidate.card.frontId === source.frontId) runCardTrigger(state, candidate.owner, candidate.card, candidate.card.cardId, 'after_card_played_here', triggering);
+    runCardTrigger(state, candidate.owner, candidate.card, candidate.card.cardId, candidate.owner.playerId === playedOwner.playerId ? 'after_ally_played' : 'after_enemy_played', triggering);
   }
 }
 
@@ -398,33 +501,80 @@ function deployCards(state: GameState, owner: PlayerState, intent: TurnIntent): 
     const definition = state.cardCatalog[deployment.cardId];
     if (!definition) throw new RuleError('UNKNOWN_CARD', `Unknown card: ${deployment.cardId}`);
     const front = getFrontState(state, deployment.frontId);
+    runCardTrigger(state, owner, undefined, definition.cardId, 'before_play', { playerId: owner.playerId, frontId: deployment.frontId });
+    owner.energy = Math.max(0, owner.energy - getEffectiveCost(state, definition, deployment.frontId, owner.playerId));
     owner.hand.splice(handIndex, 1);
-    const delayed = definition.abilityId === 'ambush' || front.definition.effectId === 'delayed_reveal';
+    const abilities = getCardAbilities(definition);
+    const delayed = abilities.some((ability) => ability.abilityId === 'ambush') || ['delayed_reveal', 'reverse_reveal'].includes(front.definition.effectId);
     const source: CardInstance = {
       instanceId: `${state.gameId}-${state.nextInstanceId}`,
       cardId: definition.cardId,
       ownerId: owner.playerId,
       currentPower: definition.power,
       frontId: deployment.frontId,
-      revealed: !delayed,
+      currentCost: definition.cost,
+      revealed: false,
       silenced: front.definition.effectId === 'silence',
       deployedTurn: state.turn,
-      modifiers: []
+      modifiers: [],
+      markers: {},
+      statuses: [],
+      abilityUsage: {},
+      moved: false,
+      createdByEffect: false
     };
     state.nextInstanceId += 1;
     owner.fronts[deployment.frontId]?.push(source);
+    owner.counters ??= { deployments: 0, moves: 0, deaths: 0, discards: 0, cardsDrawn: 0 };
+    owner.counters.deployments += 1;
     appendEvent(state, 'card_deployed', {
       playerId: owner.playerId,
       instanceId: source.instanceId,
-      cardId: source.revealed ? source.cardId : null,
+      cardId: delayed ? null : source.cardId,
       frontId: source.frontId,
-      revealed: source.revealed
+      revealed: !delayed
     });
-    if (source.revealed && !source.silenced && definition.trigger === 'deploy') {
-      runAbility(state, owner, source);
-      if (front.definition.effectId === 'repeat_reveal') runAbility(state, owner, source);
+    runCardTrigger(state, owner, source, source.cardId, 'on_play', { instanceId: source.instanceId, playerId: owner.playerId, frontId: source.frontId });
+    if (!delayed) {
+      revealCard(state, owner, source);
+      if (front.definition.effectId === 'repeat_reveal') runCardTrigger(state, owner, source, source.cardId, 'on_deploy');
     }
+    if (front.definition.effectId === 'first_play_bonus' && (owner.fronts[source.frontId] ?? []).filter((card) => card.deployedTurn === state.turn).length === 1) {
+      const bonus = asNumber(front.definition.effectArgs?.amount, 2);
+      source.currentPower += bonus;
+      source.modifiers.push({ source: `front:${source.frontId}:first`, amount: bonus });
+    }
+    if (front.definition.effectId === 'last_slot_bonus' && (owner.fronts[source.frontId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, source.frontId)) {
+      const bonus = asNumber(front.definition.effectArgs?.amount, 4);
+      source.currentPower += bonus;
+      source.modifiers.push({ source: `front:${source.frontId}:last`, amount: bonus });
+    }
+    if (front.definition.effectId === 'modern_exchange' && (front.definition.effectArgs?.eras as unknown[] | undefined)?.includes(definition.era)) {
+      front.state ??= {};
+      const key = `drawn:${owner.playerId}`;
+      if (!front.state[key]) { front.state[key] = true; drawCards(state, owner, asNumber(front.definition.effectArgs?.count, 1)); }
+    }
+    runPlayedReactions(state, owner, source);
   }
+}
+
+function moveInstance(state: GameState, owner: PlayerState, card: CardInstance, targetId: string, reason: string): number {
+  const origin = getFrontState(state, card.frontId);
+  const target = getFrontState(state, targetId);
+  if (card.frontId === targetId || origin.definition.effectId === 'no_move' || target.definition.effectId === 'no_move') return 0;
+  if (origin.movementBlockedFor?.includes(owner.playerId) || target.movementBlockedFor?.includes(owner.playerId)) return 0;
+  if ((owner.fronts[targetId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, targetId)) return 0;
+  runCardTrigger(state, owner, card, card.cardId, 'before_move', { instanceId: card.instanceId, playerId: owner.playerId, frontId: targetId });
+  const fromId = card.frontId;
+  owner.fronts[fromId] = owner.fronts[fromId]!.filter((item) => item.instanceId !== card.instanceId);
+  card.frontId = targetId;
+  card.moved = true;
+  owner.fronts[targetId]!.push(card);
+  owner.counters ??= { deployments: 0, moves: 0, deaths: 0, discards: 0, cardsDrawn: 0 };
+  owner.counters.moves += 1;
+  appendEvent(state, 'card_moved', { playerId: owner.playerId, instanceId: card.instanceId, from: fromId, to: targetId, reason });
+  runCardTrigger(state, owner, card, card.cardId, 'after_move', { instanceId: card.instanceId, playerId: owner.playerId, frontId: fromId });
+  return 1;
 }
 
 function moveOneLeft(state: GameState, owner: PlayerState): number {
@@ -433,12 +583,22 @@ function moveOneLeft(state: GameState, owner: PlayerState): number {
     const toId = state.fronts[index - 1]?.definition.frontId;
     if (!fromId || !toId) continue;
     const card = owner.fronts[fromId]?.at(-1);
-    if (!card || (owner.fronts[toId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, toId)) continue;
-    owner.fronts[fromId] = owner.fronts[fromId]!.filter((item) => item.instanceId !== card.instanceId);
-    card.frontId = toId;
-    owner.fronts[toId]?.push(card);
-    appendEvent(state, 'card_moved', { playerId: owner.playerId, instanceId: card.instanceId, from: fromId, to: toId, reason: 'front' });
-    return 1;
+    if (!card) continue;
+    const changed = moveInstance(state, owner, card, toId, 'front_left');
+    if (changed) return changed;
+  }
+  return 0;
+}
+
+function moveOneRight(state: GameState, owner: PlayerState): number {
+  for (let index = 0; index < state.fronts.length - 1; index += 1) {
+    const fromId = state.fronts[index]?.definition.frontId;
+    const toId = state.fronts[index + 1]?.definition.frontId;
+    if (!fromId || !toId) continue;
+    const card = owner.fronts[fromId]?.at(-1);
+    if (!card) continue;
+    const changed = moveInstance(state, owner, card, toId, 'front_right');
+    if (changed) return changed;
   }
   return 0;
 }
@@ -451,12 +611,61 @@ function moveRandom(state: GameState, owner: PlayerState, rng: SeededRandom): nu
   const targetIndexes = [fromIndex - 1, fromIndex + 1].filter((index) => index >= 0 && index < state.fronts.length);
   if (targetIndexes.length === 0) return 0;
   const targetId = state.fronts[rng.pick(targetIndexes)]?.definition.frontId;
-  if (!targetId || (owner.fronts[targetId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, targetId)) return 0;
-  owner.fronts[card.frontId] = owner.fronts[card.frontId]!.filter((item) => item.instanceId !== card.instanceId);
-  const fromId = card.frontId;
-  card.frontId = targetId;
-  owner.fronts[targetId]?.push(card);
-  appendEvent(state, 'card_moved', { playerId: owner.playerId, instanceId: card.instanceId, from: fromId, to: targetId, reason: 'front_random' });
+  return targetId ? moveInstance(state, owner, card, targetId, 'front_random') : 0;
+}
+
+function runDestroyedReactions(state: GameState, destroyedOwner: PlayerState, card: CardInstance): void {
+  const snapshot = state.players.flatMap((owner) => Object.values(owner.fronts).flatMap((cards) => cards.map((candidate) => ({ owner, card: candidate }))));
+  for (const candidate of snapshot) {
+    if (!candidate.card.revealed || candidate.card.silenced) continue;
+    runCardTrigger(
+      state,
+      candidate.owner,
+      candidate.card,
+      candidate.card.cardId,
+      candidate.owner.playerId === destroyedOwner.playerId ? 'after_ally_destroyed' : 'after_enemy_destroyed',
+      { instanceId: card.instanceId, playerId: destroyedOwner.playerId, frontId: card.frontId }
+    );
+  }
+}
+
+function destroyInstance(state: GameState, owner: PlayerState, card: CardInstance, reason: string): number {
+  if (card.statuses?.includes('immune') || card.statuses?.includes('protected')) return 0;
+  const lane = owner.fronts[card.frontId] ?? [];
+  if (!lane.some((candidate) => candidate.instanceId === card.instanceId)) return 0;
+  runCardTrigger(state, owner, card, card.cardId, 'on_destroy', { instanceId: card.instanceId, playerId: owner.playerId, frontId: card.frontId });
+  owner.fronts[card.frontId] = lane.filter((candidate) => candidate.instanceId !== card.instanceId);
+  owner.graveyard.push(card);
+  owner.counters ??= { deployments: 0, moves: 0, deaths: 0, discards: 0, cardsDrawn: 0 };
+  owner.counters.deaths += 1;
+  const origin = getFrontState(state, card.frontId);
+  if (origin.definition.effectId === 'first_death_revive') {
+    origin.state ??= {};
+    const key = `fallen:${owner.playerId}`;
+    if (!origin.state[key]) origin.state[key] = card.instanceId;
+  }
+  appendEvent(state, 'card_destroyed', { playerId: owner.playerId, instanceId: card.instanceId, cardId: card.cardId, reason });
+  for (const boon of state.fronts.filter((front) => front.definition.effectId === 'death_boon' && front.definition.frontId !== card.frontId)) {
+    const weakest = [...(owner.fronts[boon.definition.frontId] ?? [])].sort((left, right) => left.currentPower - right.currentPower || left.instanceId.localeCompare(right.instanceId))[0];
+    if (weakest) {
+      const amount = asNumber(boon.definition.effectArgs?.amount, 2);
+      weakest.currentPower += amount;
+      weakest.modifiers.push({ source: `front:${boon.definition.frontId}:death`, amount });
+    }
+  }
+  runDestroyedReactions(state, owner, card);
+  return 1;
+}
+
+function discardOne(state: GameState, owner: PlayerState, reason: string): number {
+  const cardId = owner.hand.shift();
+  if (!cardId) return 0;
+  owner.discarded ??= [];
+  owner.discarded.push(cardId);
+  owner.counters ??= { deployments: 0, moves: 0, deaths: 0, discards: 0, cardsDrawn: 0 };
+  owner.counters.discards += 1;
+  appendEvent(state, 'card_discarded', { playerId: owner.playerId, cardId, reason });
+  runCardTrigger(state, owner, undefined, cardId, 'on_discard', { playerId: owner.playerId });
   return 1;
 }
 
@@ -472,6 +681,50 @@ export function applyFrontTurnEffect(state: GameState, frontId: string, supplied
     case 'random_move':
       for (const owner of state.players) changed += moveRandom(state, owner, rng);
       break;
+    case 'move_right':
+      for (const owner of state.players) changed += moveOneRight(state, owner);
+      break;
+    case 'center_reinforce': {
+      const centerId = state.fronts[1]?.definition.frontId;
+      if (centerId) for (const owner of state.players) {
+        for (const side of [state.fronts[0]?.definition.frontId, state.fronts[2]?.definition.frontId]) {
+          const card = side ? owner.fronts[side]?.at(-1) : undefined;
+          if (card) changed += moveInstance(state, owner, card, centerId, 'front_center');
+        }
+      }
+      break;
+    }
+    case 'flank_reinforce': {
+      const centerId = state.fronts[1]?.definition.frontId;
+      if (centerId) for (const owner of state.players) {
+        const card = owner.fronts[centerId]?.at(-1);
+        const sides = [state.fronts[0]?.definition.frontId, state.fronts[2]?.definition.frontId].filter((value): value is string => Boolean(value));
+        const targetId = sides.sort((left, right) => (owner.fronts[left]?.reduce((sum, item) => sum + item.currentPower, 0) ?? 0) - (owner.fronts[right]?.reduce((sum, item) => sum + item.currentPower, 0) ?? 0))[0];
+        if (card && targetId) changed += moveInstance(state, owner, card, targetId, 'front_flank');
+      }
+      break;
+    }
+    case 'rotate_positions':
+      if (state.turn % asNumber(front.definition.effectArgs?.every, 2) === 0) for (const owner of state.players) changed += moveOneRight(state, owner);
+      break;
+    case 'swap_adjacent': {
+      const sourceIndex = state.fronts.findIndex((candidate) => candidate.definition.frontId === frontId);
+      const adjacentId = state.fronts[sourceIndex === 0 ? 1 : sourceIndex - 1]?.definition.frontId;
+      if (adjacentId) for (const owner of state.players) {
+        const strongest = [...(owner.fronts[frontId] ?? [])].sort((a, b) => b.currentPower - a.currentPower || a.instanceId.localeCompare(b.instanceId))[0];
+        const weakest = [...(owner.fronts[adjacentId] ?? [])].sort((a, b) => a.currentPower - b.currentPower || a.instanceId.localeCompare(b.instanceId))[0];
+        if (strongest && weakest) {
+          owner.fronts[frontId] = owner.fronts[frontId]!.filter((card) => card.instanceId !== strongest.instanceId);
+          owner.fronts[adjacentId] = owner.fronts[adjacentId]!.filter((card) => card.instanceId !== weakest.instanceId);
+          strongest.frontId = adjacentId;
+          weakest.frontId = frontId;
+          owner.fronts[frontId]!.push(weakest);
+          owner.fronts[adjacentId]!.push(strongest);
+          changed += 2;
+        }
+      }
+      break;
+    }
     case 'recruit':
       for (const owner of state.players) {
         if ((owner.fronts[frontId]?.length ?? 0) > 0) changed += drawCards(state, owner, asNumber(front.definition.effectArgs?.count, 1)).length;
@@ -492,9 +745,7 @@ export function applyFrontTurnEffect(state: GameState, frontId: string, supplied
       const max = Math.max(...state.players.map((owner) => owner.hand.length));
       const targets = state.players.filter((owner) => owner.hand.length === max && max > 0);
       if (targets.length === 1) {
-        const discarded = targets[0]!.hand.shift();
-        appendEvent(state, 'card_discarded', { playerId: targets[0]!.playerId, cardId: discarded ?? null, reason: 'front' });
-        changed += discarded ? 1 : 0;
+        changed += discardOne(state, targets[0]!, 'front');
       }
       break;
     }
@@ -504,10 +755,7 @@ export function applyFrontTurnEffect(state: GameState, frontId: string, supplied
       );
       const victim = candidates.sort((left, right) => left.card.currentPower - right.card.currentPower || left.card.instanceId.localeCompare(right.card.instanceId))[0];
       if (victim) {
-        victim.owner.fronts[frontId] = victim.owner.fronts[frontId]!.filter((card) => card.instanceId !== victim.card.instanceId);
-        victim.owner.graveyard.push(victim.card);
-        appendEvent(state, 'card_destroyed', { playerId: victim.owner.playerId, instanceId: victim.card.instanceId, reason: 'front' });
-        changed = 1;
+        changed = destroyInstance(state, victim.owner, victim.card, 'front');
       }
       break;
     }
@@ -517,10 +765,71 @@ export function applyFrontTurnEffect(state: GameState, frontId: string, supplied
         if (restored) {
           owner.hand.push(restored.cardId);
           appendEvent(state, 'card_returned', { playerId: owner.playerId, cardId: restored.cardId, reason: 'front' });
+          runCardTrigger(state, owner, undefined, restored.cardId, 'on_return_to_hand', { playerId: owner.playerId, frontId });
           changed += 1;
         }
       }
       break;
+    case 'turn_draw': {
+      const turns = Array.isArray(front.definition.effectArgs?.turns) ? front.definition.effectArgs.turns.map(Number) : [3, 5];
+      if (turns.includes(state.turn)) for (const owner of state.players) if ((owner.fronts[frontId]?.length ?? 0) > 0) changed += drawCards(state, owner, asNumber(front.definition.effectArgs?.count, 1)).length;
+      break;
+    }
+    case 'unused_energy_power':
+      front.state ??= {};
+      for (const owner of state.players) {
+        const key = `reserve:${owner.playerId}`;
+        const gain = owner.energy * asNumber(front.definition.effectArgs?.amount, 1);
+        front.state[key] = asNumber(front.state[key], 0) + gain;
+        changed += gain;
+      }
+      break;
+    case 'shuffle_discard':
+      for (const owner of state.players) {
+        const cardId = owner.discarded?.shift();
+        if (!cardId) continue;
+        owner.deck.splice(rng.int(owner.deck.length + 1), 0, cardId);
+        changed += 1 + drawCards(state, owner, asNumber(front.definition.effectArgs?.count, 1)).length;
+      }
+      break;
+    case 'first_death_revive':
+      front.state ??= {};
+      for (const owner of state.players) {
+        const key = `fallen:${owner.playerId}`;
+        const instanceId = asString(front.state[key]);
+        const card = owner.graveyard.find((candidate) => candidate.instanceId === instanceId);
+        if (!card || (owner.fronts[frontId]?.length ?? 0) >= getFrontCapacity(state, owner.playerId, frontId)) continue;
+        owner.graveyard = owner.graveyard.filter((candidate) => candidate.instanceId !== card.instanceId);
+        card.frontId = frontId;
+        card.revealed = true;
+        const amount = asNumber(front.definition.effectArgs?.amount, 2);
+        card.currentPower += amount;
+        card.modifiers.push({ source: `front:${frontId}:revive`, amount });
+        owner.fronts[frontId]!.push(card);
+        delete front.state[key];
+        changed += 1;
+      }
+      break;
+    case 'front_closes':
+      if (state.turn === asNumber(front.definition.effectArgs?.turn, 5)) {
+        for (const owner of state.players) for (const card of [...(owner.fronts[frontId] ?? [])]) changed += destroyInstance(state, owner, card, 'front_closed');
+      }
+      break;
+    case 'leader_pressure': {
+      const [first, second] = state.players;
+      const firstPower = (first.fronts[frontId] ?? []).reduce((sum, card) => sum + card.currentPower, 0);
+      const secondPower = (second.fronts[frontId] ?? []).reduce((sum, card) => sum + card.currentPower, 0);
+      if (firstPower !== secondPower) {
+        const leader = firstPower > secondPower ? first : second;
+        const trailer = leader === first ? second : first;
+        const strongest = [...(leader.fronts[frontId] ?? [])].sort((a, b) => b.currentPower - a.currentPower)[0];
+        const weakest = [...(trailer.fronts[frontId] ?? [])].sort((a, b) => a.currentPower - b.currentPower)[0];
+        const amount = asNumber(front.definition.effectArgs?.amount, 2);
+        if (strongest) { strongest.currentPower -= amount; changed += 1; }
+        if (weakest) { weakest.currentPower += amount; changed += 1; }
+      }
+      break;
+    }
     case 'silence':
       for (const owner of state.players) {
         for (const card of owner.fronts[frontId] ?? []) {
@@ -551,6 +860,37 @@ export function applyFrontTurnEffect(state: GameState, frontId: string, supplied
     case 'solo_bonus':
     case 'full_bonus':
     case 'cross_era_bonus':
+    case 'ancient_concord':
+    case 'medieval_bastion':
+    case 'modern_exchange':
+    case 'future_beacon':
+    case 'same_era_focus':
+    case 'era_diversity':
+    case 'same_region_focus':
+    case 'region_diversity':
+    case 'faction_muster':
+    case 'profession_conclave':
+    case 'tag_chain':
+    case 'identity_council':
+    case 'no_move':
+    case 'capacity_by_turn':
+    case 'single_deploy':
+    case 'first_play_bonus':
+    case 'last_slot_bonus':
+    case 'hand_cost_down':
+    case 'low_cost_surcharge':
+    case 'high_cost_discount':
+    case 'first_card_discount':
+    case 'final_turn_discount':
+    case 'discard_reward':
+    case 'reverse_reveal':
+    case 'unrevealed_bonus':
+    case 'late_front_reveal':
+    case 'concealed_lane':
+    case 'reveal_all_early':
+    case 'graveyard_power':
+    case 'death_boon':
+    case 'shared_margin':
       break;
     default:
       return { applied: false, changed: 0 };
@@ -570,20 +910,38 @@ function resolveAllFrontEffects(state: GameState): void {
 
 export function calculateFrontPower(state: GameState, playerId: PlayerId, frontId: string): number {
   const owner = getPlayer(state, playerId);
+  const opponent = getOpponent(state, playerId);
   const lane = owner.fronts[frontId] ?? [];
-  const front = getFrontState(state, frontId).definition;
+  const frontState = getFrontState(state, frontId);
+  const front = frontState.definition;
   let total = lane.reduce((sum, card) => sum + card.currentPower, 0);
-  for (const card of lane) {
-    const definition = state.cardCatalog[card.cardId];
-    if (!definition) continue;
-    if (!card.silenced && definition.abilityId === 'ongoing_allies') total += Math.max(0, lane.length - 1);
-    if (!card.silenced && definition.abilityId === 'command_aura') total += Math.max(0, lane.length - 1);
-    if (!card.silenced && definition.abilityId === 'lone_warrior' && lane.length === 1) total += 3;
-    if (!card.silenced && definition.abilityId === 'synergy_tag') {
-      total += lane.filter((ally) => ally.instanceId !== card.instanceId && state.cardCatalog[ally.cardId]?.tags.some((tag) => definition.tags.includes(tag))).length;
+  for (const sourceOwner of state.players) {
+    for (const source of Object.values(sourceOwner.fronts).flat()) {
+      const definition = state.cardCatalog[source.cardId];
+      if (!definition || !source.revealed || source.silenced) continue;
+      for (const ability of getCardAbilities(definition).filter((candidate) => candidate.trigger === 'ongoing')) {
+        const adjustments = ongoingPowerAdjustments({
+          gameState: state,
+          ability,
+          sourceCardId: source.cardId,
+          sourceInstanceId: source.instanceId,
+          sourcePlayerId: sourceOwner.playerId,
+          sourceFrontId: source.frontId,
+          turn: state.turn,
+          eventQueue: [],
+          depth: 0
+        });
+        for (const card of lane) total += adjustments.get(card.instanceId) ?? 0;
+      }
     }
   }
   const value = asNumber(front.effectArgs?.amount, 0);
+  const definitions = lane.map((card) => state.cardCatalog[card.cardId]).filter((card): card is CardDefinition => Boolean(card));
+  const groupCount = (field: 'era' | 'region' | 'faction' | 'profession' | 'identity'): Map<string, number> => {
+    const groups = new Map<string, number>();
+    for (const definition of definitions) groups.set(definition[field], (groups.get(definition[field]) ?? 0) + 1);
+    return groups;
+  };
   switch (front.effectId) {
     case 'base_power_up': total += lane.length * value; break;
     case 'base_power_down': total -= lane.length * value; break;
@@ -597,10 +955,53 @@ export function calculateFrontPower(state: GameState, playerId: PlayerId, frontI
     }
     case 'invert_power': if (state.turn === STANDARD_TURNS) total *= -1; break;
     case 'negative_bonus': total += lane.filter((card) => card.currentPower < 0).length * value; break;
-    case 'vanilla_bonus': total += lane.filter((card) => card.silenced || !ABILITY_REGISTRY.has(state.cardCatalog[card.cardId]?.abilityId ?? '')).length * value; break;
+    case 'vanilla_bonus': total += lane.filter((card) => card.silenced || getCardAbilities(state.cardCatalog[card.cardId]!).length === 0).length * value; break;
     case 'solo_bonus': if (lane.length === 1) total += value; break;
     case 'full_bonus': if (lane.length >= getFrontCapacity(state, playerId, frontId)) total += value; break;
     case 'cross_era_bonus': total += new Set(lane.map((card) => state.cardCatalog[card.cardId]?.era).filter(Boolean)).size * value; break;
+    case 'ancient_concord': {
+      const eras = Array.isArray(front.effectArgs?.eras) ? front.effectArgs.eras : [];
+      total += definitions.filter((card) => eras.includes(card.era)).length * value;
+      break;
+    }
+    case 'medieval_bastion': {
+      const term = asString(front.effectArgs?.eraIncludes, '中世纪');
+      const penalty = asNumber(front.effectArgs?.penalty, 1);
+      total += definitions.reduce((sum, card) => sum + (card.era.includes(term) ? value : -penalty), 0);
+      break;
+    }
+    case 'future_beacon': total += definitions.filter((card) => card.era === asString(front.effectArgs?.era, '未来时代')).length * value; break;
+    case 'same_era_focus': if (lane.length > 0 && groupCount('era').size === 1) total += value; break;
+    case 'era_diversity': total += groupCount('era').size * value; break;
+    case 'same_region_focus': if (lane.length > 0 && groupCount('region').size === 1) total += value; break;
+    case 'region_diversity': total += groupCount('region').size * value; break;
+    case 'faction_muster': total += [...groupCount('faction').values()].reduce((sum, count) => sum + count * Math.max(0, count - 1) * value, 0); break;
+    case 'profession_conclave': total += [...groupCount('profession').values()].reduce((sum, count) => sum + Math.max(0, count - 1) * value, 0); break;
+    case 'tag_chain': {
+      const qualifying = new Set<string>();
+      for (let index = 0; index < lane.length - 1; index += 1) {
+        const left = state.cardCatalog[lane[index]!.cardId];
+        const right = state.cardCatalog[lane[index + 1]!.cardId];
+        if (left?.tags.some((tag) => right?.tags.includes(tag))) { qualifying.add(lane[index]!.instanceId); qualifying.add(lane[index + 1]!.instanceId); }
+      }
+      total += qualifying.size * value;
+      break;
+    }
+    case 'identity_council': total += groupCount('identity').size * value; break;
+    case 'unrevealed_bonus': total += lane.filter((card) => !card.revealed).length * value; break;
+    case 'unused_energy_power': total += asNumber(frontState.state?.[`reserve:${playerId}`], 0); break;
+    case 'discard_reward': total += (owner.counters?.discards ?? 0) * value; break;
+    case 'graveyard_power': total += Math.min(asNumber(front.effectArgs?.maximum, 6), owner.graveyard.length * value); break;
+  }
+  for (const sharingFront of state.fronts.filter((candidate) => candidate.definition.effectId === 'shared_margin' && candidate.definition.frontId !== frontId)) {
+    const sharingId = sharingFront.definition.frontId;
+    const own = (owner.fronts[sharingId] ?? []).reduce((sum, card) => sum + card.currentPower, 0);
+    const enemy = (opponent.fronts[sharingId] ?? []).reduce((sum, card) => sum + card.currentPower, 0);
+    if (own <= enemy) continue;
+    const alternatives = state.fronts.filter((candidate) => candidate.definition.frontId !== sharingId)
+      .map((candidate) => ({ id: candidate.definition.frontId, power: (owner.fronts[candidate.definition.frontId] ?? []).reduce((sum, card) => sum + card.currentPower, 0) }))
+      .sort((left, right) => left.power - right.power || left.id.localeCompare(right.id));
+    if (alternatives[0]?.id === frontId) total += Math.floor((own - enemy) * asNumber(sharingFront.definition.effectArgs?.ratio, 0.5));
   }
   return total;
 }
@@ -651,6 +1052,31 @@ export function calculateWinner(state: GameState): GameWinner {
   return { winnerId: null, reason: 'draw', stake: state.stake.current, frontWinners, totals };
 }
 
+function revealReverseDeployments(state: GameState): void {
+  for (const front of state.fronts.filter((candidate) => candidate.definition.effectId === 'reverse_reveal')) {
+    for (const owner of state.players) {
+      const hidden = (owner.fronts[front.definition.frontId] ?? [])
+        .filter((card) => !card.revealed && card.deployedTurn === state.turn)
+        .sort((left, right) => right.instanceId.localeCompare(left.instanceId));
+      for (const card of hidden) revealCard(state, owner, card);
+    }
+  }
+}
+
+function runFrontOutcomeTriggers(state: GameState, winner: GameWinner): void {
+  for (const front of state.fronts) {
+    const frontId = front.definition.frontId;
+    const winningPlayerId = winner.frontWinners[frontId];
+    if (!winningPlayerId) continue;
+    for (const owner of state.players) {
+      const trigger: AbilityTrigger = winningPlayerId === owner.playerId ? 'on_front_won' : 'on_front_lost';
+      for (const card of [...(owner.fronts[frontId] ?? [])]) {
+        if (card.revealed && !card.silenced) runCardTrigger(state, owner, card, card.cardId, trigger, { ...(winningPlayerId ? { playerId: winningPlayerId } : {}), frontId });
+      }
+    }
+  }
+}
+
 export function resolveTurn(state: GameState): GameState {
   if (state.phase !== 'planning') throw new RuleError('NOT_PLANNING', 'Turn resolution requires the planning phase.');
   if (!state.players.every((owner) => owner.locked)) throw new RuleError('PLAYERS_NOT_LOCKED', 'Both players must lock before resolution.');
@@ -663,11 +1089,15 @@ export function resolveTurn(state: GameState): GameState {
   for (const owner of ordered) {
     deployCards(state, owner, owner.intent ?? { requestId: `auto-${state.turn}-${owner.playerId}`, turn: state.turn, deployments: [] });
   }
+  revealReverseDeployments(state);
   runBoardTrigger(state, 'turn_end');
   resolveAllFrontEffects(state);
   appendEvent(state, 'turn_resolved', { turn: state.turn });
   if (state.turn >= STANDARD_TURNS) {
     runBoardTrigger(state, 'finale');
+    runBoardTrigger(state, 'before_scoring');
+    const preliminary = calculateWinner(state);
+    runFrontOutcomeTriggers(state, preliminary);
     state.winner = calculateWinner(state);
     state.phase = 'ended';
     appendEvent(state, 'game_ended', { winner: state.winner });
@@ -748,13 +1178,15 @@ function buildView(state: GameState, perspective?: PlayerId): PlayerView {
     phase: state.phase,
     sequence: state.sequence,
     initiativePlayerId: state.initiativePlayerId,
+    ...(state.setup.catalogVersion ? { catalogVersion: state.setup.catalogVersion } : {}),
     fronts: state.fronts.map((front) => {
       const frontId = front.definition.frontId;
       const cards: PlayerView['fronts'][number]['cards'] = {};
       const power: Record<PlayerId, number | null> = {};
       for (const owner of state.players) {
-        cards[owner.playerId] = (owner.fronts[frontId] ?? []).map((card) => cardView(card, ended || owner.playerId === perspective || card.revealed));
-        const hidesPower = front.definition.effectId === 'hidden_power' && !ended && owner.playerId !== perspective;
+        const concealsLane = front.definition.effectId === 'concealed_lane' && !ended && owner.playerId !== perspective;
+        cards[owner.playerId] = (owner.fronts[frontId] ?? []).map((card) => cardView(card, !concealsLane && (ended || owner.playerId === perspective || card.revealed)));
+        const hidesPower = ['hidden_power', 'concealed_lane'].includes(front.definition.effectId) && !ended && owner.playerId !== perspective;
         power[owner.playerId] = front.revealed && !hidesPower ? calculateFrontPower(state, owner.playerId, frontId) : null;
       }
       const result: PlayerView['fronts'][number] = { definition: clone(front.definition), revealed: front.revealed, cards, power };

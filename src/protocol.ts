@@ -1,10 +1,10 @@
-import type { GameEvent, PlayerView, TurnIntent } from './types.js';
+import type { GameEvent, PlayerView, SubmittedDeck, TurnIntent } from './types.js';
 
 export type ClientAction =
   | { action: 'status'; protocolVersion: string; requestId: string }
   | { action: 'authenticate'; protocolVersion: string; requestId: string; password: string }
   | { action: 'join'; protocolVersion: string; requestId: string; name: string; reconnectToken?: string }
-  | { action: 'selectDeck'; protocolVersion: string; requestId: string; deckId?: string; cardIds: string[] }
+  | { action: 'selectDeck'; protocolVersion: string; requestId: string; deckId?: string; cardIds: string[]; catalogVersion?: string; deck?: SubmittedDeck }
   | { action: 'ready'; protocolVersion: string; requestId: string }
   | { action: 'submitTurn'; protocolVersion: string; requestId: string; intent: TurnIntent }
   | { action: 'undoTurn'; protocolVersion: string; requestId: string; turn: number }
@@ -13,7 +13,7 @@ export type ClientAction =
   | { action: 'withdraw'; protocolVersion: string; requestId: string; turn: number }
   | { action: 'requestSync'; protocolVersion: string; requestId: string }
   | { action: 'requestRematch'; protocolVersion: string; requestId: string }
-  | { action: 'practice'; protocolVersion: string; requestId: string; deckId?: string; cardIds: string[] }
+  | { action: 'practice'; protocolVersion: string; requestId: string; deckId?: string; cardIds: string[]; catalogVersion?: string; deck?: SubmittedDeck }
   | { action: 'chatMessage'; protocolVersion: string; requestId: string; message: string }
   | { action: 'pong'; protocolVersion: string; requestId: string };
 

@@ -152,9 +152,9 @@ describe('data validation', () => {
     expect(validateDeck(deck, Object.fromEntries(cards.map((card) => [card.cardId, card]))).ok).toBe(false);
   });
 
-  it('accepts all thirty front definitions together', () => {
+  it('accepts all seventy-two front definitions together', () => {
     expect(validateFrontDefinitions(FRONT_DEFINITIONS)).toEqual([]);
-    expect(FRONT_DEFINITIONS).toHaveLength(30);
+    expect(FRONT_DEFINITIONS).toHaveLength(72);
   });
 });
 
@@ -173,7 +173,7 @@ describe.each(FRONT_DEFINITIONS)('front $frontId', (front) => {
 describe.each(ABILITY_DEFINITIONS)('ability $abilityId', (ability) => {
   it('is registered with a trigger and target rule', () => {
     expect(ABILITY_REGISTRY.has(ability.abilityId)).toBe(true);
-    expect(['deploy', 'ongoing', 'turn_start', 'turn_end', 'finale']).toContain(ability.trigger);
+    expect(['deploy', 'on_play', 'ongoing', 'turn_start', 'turn_end', 'finale']).toContain(ability.trigger);
     expect(ability.targetRule.length).toBeGreaterThan(0);
   });
 });
